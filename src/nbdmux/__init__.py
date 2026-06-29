@@ -3,17 +3,17 @@
 Two surfaces:
 
 - ``nbdmux-server`` (``nbdmux.server:main``) -- the daemon. Manages an
-  ``nbdkit`` subprocess that exposes registered local files as named
-  NBD exports on a TCP port (default 10809). Operator dashboard +
-  HTTP control API on a separate port (default 4040).
+  ``nbd-server`` subprocess that exposes registered local files as
+  named NBD exports on a TCP port (default 10809). Operator dashboard
+  + HTTP control API on a separate port (default 4040).
 - ``nbdmux.client`` -- a tiny stdlib-only library for other tools
   (e.g. bty) to register / list / unregister exports without
   reimplementing the HTTP API.
 
 Designed for the same niche as ``withcache``: a small lab, a single
 sidecar container, no third-party Python deps. The system-level
-dependency is ``nbdkit`` (Debian / Ubuntu / Fedora ship it as
-``nbdkit-server`` + ``nbdkit-plugin-file``).
+dependency is ``nbd-server`` (Debian / Ubuntu: ``apt install
+nbd-server``; Fedora: ``dnf install nbd``).
 """
 
 from .client import add_export, list_exports, remove_export

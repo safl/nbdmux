@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: System :: Boot",
     "Topic :: System :: Filesystems",
 ]
-dependencies = []  # stdlib only, by design (delegates to the system's nbdkit)
+dependencies = []  # stdlib only, by design (delegates to the system's nbd-server)
 
 [project.urls]
 Homepage = "https://github.com/safl/nbdmux"
