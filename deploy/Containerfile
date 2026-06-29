@@ -1,0 +1,43 @@
+# nbdmux container -- bundles the daemon + nbd-server + minimal Python.
+#
+# Build:  podman build -t ghcr.io/safl/nbdmux:dev -f deploy/Containerfile .
+# Run:    see deploy/compose.yml for the production shape.
+#
+# Two ports:
+#   4040   HTTP control plane + operator UI
+#  10809   NBD (nbd-server)
+
+FROM debian:trixie-slim
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        nbd-server \
+        python3 \
+        python3-pip \
+        ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE /app/
+COPY src/ /app/src/
+RUN pip install --break-system-packages --no-cache-dir .
+
+# Persistent state lives under /data. The compose stack binds this to a
+# named volume so a container rebuild keeps registered exports.
+ENV NBDMUX_DATA_DIR=/data
+VOLUME ["/data"]
+
+# Image files we serve as NBD exports live under /images (a read-only
+# bind from the host that holds the actual .img bytes). This is just
+# the convention; the daemon will serve any absolute path the operator
+# registers.
+VOLUME ["/images"]
+
+EXPOSE 4040 10809
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s \
+    CMD python3 -c "import urllib.request, sys; \
+        sys.exit(0 if urllib.request.urlopen('http://localhost:4040/healthz', timeout=2).status == 200 else 1)"
+
+ENTRYPOINT ["nbdmux-server"]
+CMD ["--data-dir", "/data", "--port", "4040", "--nbd-port", "10809"]
