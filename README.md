@@ -24,9 +24,9 @@ container, no third-party Python deps. Operationally:
 
 | Path                       | What it is                                                              |
 |----------------------------|-------------------------------------------------------------------------|
-| `src/nbdmux/server.py`     | The daemon. HTTP control plane + nbdkit subprocess management + operator UI |
-| `src/nbdmux/client.py`     | Stdlib-only Python client library for other tools                       |
-| `deploy/Containerfile`     | Single-image deploy (Python + nbdkit)                                   |
+| `src/nbdmux/server.py`     | The daemon. HTTP control plane + nbd-server subprocess management + operator UI |
+| `src/nbdmux/client.py`     | Stdlib-only Python client library for other tools                           |
+| `deploy/Containerfile`     | Single-image deploy (Python + nbd-server)                                   |
 | `deploy/compose.yml`       | Reference compose stack                                                 |
 
 ## System dependency
@@ -91,7 +91,7 @@ Single-tenant, server-signed cookie -- same pattern as withcache. Set
 `NBDMUX_ADMIN_PASSWORD` to gate the operator UI + the HTTP control
 plane. Unset = open with a startup warning.
 
-The NBD port itself is unauthenticated (nbdkit's classical model);
+The NBD port itself is unauthenticated (nbd-server's classical model);
 LAN-only assumption, firewall is the operator's responsibility.
 
 ## License
