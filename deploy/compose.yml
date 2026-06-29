@@ -1,0 +1,27 @@
+# Reference compose stack -- run as a sidecar (e.g. next to bty + withcache).
+#
+# Usage:
+#   cp envvars.example envvars && "${EDITOR:-vi}" envvars   # set NBDMUX_ADMIN_PASSWORD
+#   podman compose --env-file envvars up -d
+#   #   http://<host>:4040/   (operator UI)
+#   #   tcp://<host>:10809    (NBD)
+
+services:
+  nbdmux:
+    image: ghcr.io/safl/nbdmux:latest
+    restart: unless-stopped
+    environment:
+      NBDMUX_ADMIN_PASSWORD: "${NBDMUX_ADMIN_PASSWORD:-}"
+    ports:
+      - "${HOST_HTTP_PORT:-4040}:4040"
+      - "${HOST_NBD_PORT:-10809}:10809"
+    volumes:
+      # Persistent: state.db + nbd-server.conf survive restarts here.
+      - nbdmux-data:/data
+      # Read-only bind of the host directory holding the .img files
+      # nbdmux will serve as NBD exports. Operator places files here
+      # (or, in the bty integration, bty-web decompresses into here).
+      - "${IMAGES_HOST_DIR:-./images}:/images:ro"
+
+volumes:
+  nbdmux-data:

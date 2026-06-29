@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nbdmux"
+dynamic = ["version"]  # single source of truth: src/nbdmux/__init__.py:__version__
+description = "HTTP-controlled NBD-export multiplexer for a small lab (boot Linux images over the network with overlayfs+tmpfs writes)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Simon A. F. Lund", email = "safl@safl.dk" }]
+keywords = ["nbd", "netboot", "ramboot", "overlayfs", "lab"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Boot",
+    "Topic :: System :: Filesystems",
+]
+dependencies = []  # stdlib only, by design (delegates to the system's nbd-server)
+
+[project.urls]
+Homepage = "https://github.com/safl/nbdmux"
+
+[project.scripts]
+nbdmux-server = "nbdmux.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nbdmux"]
+
+[tool.hatch.version]
+path = "src/nbdmux/__init__.py"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

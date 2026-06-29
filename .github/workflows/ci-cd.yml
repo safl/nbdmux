@@ -1,0 +1,146 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Refuse to re-release a version PyPI already has. PyPI is immutable, but a
+  # retag-after-publish would rebuild the GitHub release assets from a newer
+  # commit and silently drift from the frozen wheel. (bty/withcache integrity
+  # guard, mirrored.)
+  check-not-published:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse if version is already on PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if curl -sfL "https://pypi.org/pypi/nbdmux/json" \
+             | python3 -c "import sys, json; sys.exit(0 if '${version}' in json.load(sys.stdin)['releases'] else 1)"; then
+            echo "::error::v${version} is already on PyPI; refusing to re-release."
+            exit 1
+          fi
+          echo "v${version} not on PyPI; proceeding."
+
+  lint:
+    needs: check-not-published
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: make lint format-check
+
+  test:
+    needs: check-not-published
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Real nbd-server isn't spawned in unit tests (handlers use a fake)
+      # so we don't install it on the runner. The deploy/Containerfile is
+      # what ships it on the operator's host.
+      - run: make test
+
+  wheels:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: make wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  tag-release:
+    needs: [lint, test, wheels]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+      - name: Tag the version if it is new
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/nbdmux/__init__.py)
+          test -n "$version" || { echo "could not read __version__"; exit 1; }
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} already exists; nothing to do."
+            exit 0
+          fi
+          git tag "${tag}"
+          git push origin "${tag}"
+          echo "Tagged ${tag}; ci-cd.yml will publish it."
+
+  publish-pypi:
+    needs: [lint, test, wheels]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: make wheel
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  publish-image:
+    needs: [lint, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/safl/nbdmux:latest
+            ghcr.io/safl/nbdmux:${{ github.ref_name }}
