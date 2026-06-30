@@ -60,7 +60,7 @@ class TestStore(unittest.TestCase):
         self.store = server.Store(self.tmpdir)
 
     def test_record_then_list(self):
-        self.store.record_export("foo", "/tmp/foo.img", readonly=True)
+        self.store.upsert_export("foo", "/tmp/foo.img", readonly=True)
         rows = self.store.list_exports()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["name"], "foo")
@@ -70,15 +70,15 @@ class TestStore(unittest.TestCase):
     def test_upsert_replaces_existing(self):
         """Re-registering an existing name replaces file + readonly --
         operator's `make sure this export points HERE` intent."""
-        self.store.record_export("foo", "/tmp/foo.img", readonly=True)
-        self.store.record_export("foo", "/tmp/foo2.img", readonly=False)
+        self.store.upsert_export("foo", "/tmp/foo.img", readonly=True)
+        self.store.upsert_export("foo", "/tmp/foo2.img", readonly=False)
         rows = self.store.list_exports()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["file"], "/tmp/foo2.img")
         self.assertFalse(rows[0]["readonly"])
 
     def test_delete_existing_returns_true(self):
-        self.store.record_export("foo", "/tmp/foo.img")
+        self.store.upsert_export("foo", "/tmp/foo.img")
         self.assertTrue(self.store.delete_export("foo"))
         self.assertEqual(self.store.list_exports(), [])
 
@@ -86,9 +86,9 @@ class TestStore(unittest.TestCase):
         self.assertFalse(self.store.delete_export("never-existed"))
 
     def test_list_sorted_by_name(self):
-        self.store.record_export("c", "/tmp/c.img")
-        self.store.record_export("a", "/tmp/a.img")
-        self.store.record_export("b", "/tmp/b.img")
+        self.store.upsert_export("c", "/tmp/c.img")
+        self.store.upsert_export("a", "/tmp/a.img")
+        self.store.upsert_export("b", "/tmp/b.img")
         names = [e["name"] for e in self.store.list_exports()]
         self.assertEqual(names, ["a", "b", "c"])
 
@@ -162,14 +162,24 @@ class _FakeNbdServer:
 
 def _start_nbdmux(password=None):
     tmpdir = tempfile.mkdtemp()
+    images_dir = os.path.join(tmpdir, "images")
+    os.makedirs(images_dir, exist_ok=True)
     store = server.Store(tmpdir)
     auth = server.Auth(b"k", password)
     nbd = _FakeNbdServer()
+    # The warmer is wired but not started; the tests in this file
+    # only exercise the {name, file} pre-warmed POST path (no
+    # src_url warming), so the worker thread doesn't need to be
+    # running. Tests that exercise the warmer build their own
+    # fixture.
+    warmer = server.Warmer(store=store, nbd=nbd, images_dir=images_dir)
     httpd = _ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
     httpd.store = store
     httpd.auth = auth
     httpd.nbd = nbd
     httpd.nbd_port = 10809
+    httpd.warmer = warmer
+    httpd.images_dir = images_dir
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, store, nbd
 
