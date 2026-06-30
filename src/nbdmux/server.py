@@ -698,46 +698,90 @@ class NbdServer:
         os.replace(tmp, self.config_path)
 
     def start(self, exports: list[dict[str, Any]]) -> None:
-        """Spawn nbd-server in foreground mode. Idempotent."""
+        """Write the config + spawn nbd-server in foreground mode.
+
+        Idempotent. If ``exports`` is empty, the subprocess is NOT
+        launched: nbd-server hard-fails with ``No configured exports;
+        quitting`` when its INI carries only ``[generic]``, and a
+        fresh nbdmux container legitimately has zero exports until
+        the first ``POST /exports`` completes. The HTTP control
+        plane stays up to accept that POST; ``reload`` lifts off as
+        soon as the first ``ready`` export lands.
+        """
         with self._lock:
             if self._proc and self._proc.poll() is None:
                 return
             self.write_config(exports)
-            # ``-d`` runs nbd-server in foreground (don't fork). We
-            # supervise the subprocess directly, so an early exit is
-            # observable via ``poll()`` rather than orphaned.
-            self._proc = subprocess.Popen(
-                [self.bin, "-d", "-C", self.config_path],
-                stdout=sys.stderr,  # mingle with nbdmux's own logs
-                stderr=sys.stderr,
-            )
-            # Give the child a moment to bind the port or fail loudly.
-            time.sleep(0.2)
-            if self._proc.poll() is not None:
-                rc = self._proc.returncode
-                self._proc = None
-                raise RuntimeError(
-                    f"nbd-server exited immediately (rc={rc}); "
-                    f"check {self.config_path} and that the binary is installed"
+            if not exports:
+                # No-op: defer the subprocess to the first reload()
+                # that has at least one export. Loud-on-stderr so
+                # the operator can see the deferred state in
+                # ``podman logs``.
+                sys.stderr.write(
+                    "nbdmux: nbd-server deferred (no exports yet); "
+                    "will start on first POST /exports + ready\n"
                 )
+                return
+            self._spawn()
 
     def reload(self, exports: list[dict[str, Any]]) -> None:
-        """Rewrite the config and SIGHUP the running daemon."""
+        """Rewrite the config + SIGHUP the running daemon, OR launch
+        it if this reload is the first non-empty one and the daemon
+        is dormant per :meth:`start`'s deferral. Idempotent."""
         with self._lock:
             self.write_config(exports)
+            if not exports:
+                # Empty reload: keep the daemon down if it isn't up
+                # yet (deferred-start case); if it IS up, leave it
+                # alone -- the SIGHUP would land on a config nbd-
+                # server would reject, killing the process.
+                if not (self._proc and self._proc.poll() is None):
+                    return
+                # Up-but-now-empty: stop it cleanly rather than let
+                # SIGHUP kill it with the no-exports error.
+                self._terminate_proc_locked()
+                return
             if self._proc and self._proc.poll() is None:
                 with contextlib.suppress(ProcessLookupError):
                     self._proc.send_signal(signal.SIGHUP)
+                return
+            # Daemon dormant + non-empty exports: lift off.
+            self._spawn()
+
+    def _spawn(self) -> None:
+        """Launch the nbd-server subprocess. Caller holds ``self._lock``
+        and has already written the config."""
+        # ``-d`` runs nbd-server in foreground (don't fork). We
+        # supervise the subprocess directly, so an early exit is
+        # observable via ``poll()`` rather than orphaned.
+        self._proc = subprocess.Popen(
+            [self.bin, "-d", "-C", self.config_path],
+            stdout=sys.stderr,  # mingle with nbdmux's own logs
+            stderr=sys.stderr,
+        )
+        # Give the child a moment to bind the port or fail loudly.
+        time.sleep(0.2)
+        if self._proc.poll() is not None:
+            rc = self._proc.returncode
+            self._proc = None
+            raise RuntimeError(
+                f"nbd-server exited immediately (rc={rc}); "
+                f"check {self.config_path} and that the binary is installed"
+            )
+
+    def _terminate_proc_locked(self) -> None:
+        """Stop the subprocess; caller holds ``self._lock``."""
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self._proc.wait(timeout=3)
+            if self._proc.poll() is None:
+                self._proc.kill()
+        self._proc = None
 
     def stop(self) -> None:
         with self._lock:
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    self._proc.wait(timeout=3)
-                if self._proc.poll() is None:
-                    self._proc.kill()
-            self._proc = None
+            self._terminate_proc_locked()
 
     def is_running(self) -> bool:
         return bool(self._proc and self._proc.poll() is None)
