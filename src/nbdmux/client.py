@@ -28,6 +28,7 @@ __all__ = [
     "control_base",
     "list_exports",
     "remove_export",
+    "warm_export",
 ]
 
 DEFAULT_TIMEOUT = 5.0  # seconds; never block the caller on a slow / unreachable daemon
@@ -104,16 +105,17 @@ def add_export(
     server: str = "http://localhost:4040",
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """Register ``file`` as a named NBD export.
+    """Register a pre-warmed file as a named NBD export.
 
-    ``name`` is the export name nbd-client will pass via ``-name``;
-    ``file`` is an absolute path that the nbdmux daemon process can
-    read. Idempotent: re-registering the same name with the same file
-    is a no-op (200 OK); re-registering with a different file replaces
-    the mapping.
+    ``name`` is the export name nbd-client connects to; ``file`` is an
+    absolute path that the nbdmux daemon process can read. Idempotent:
+    re-registering the same name replaces the mapping. The returned
+    record lands at ``status='ready'`` immediately because no warming
+    pipeline runs for this path.
 
-    Returns the export record (``{"name", "file", "readonly"}``).
-    Raises :class:`NbdmuxError` on any failure.
+    Returns the export record. Raises :class:`NbdmuxError` on any
+    failure (including the daemon refusing the file because it does
+    not exist on the daemon's filesystem).
     """
     return _request(
         "POST",
@@ -122,6 +124,34 @@ def add_export(
         body={"name": name, "file": file, "readonly": readonly},
         timeout=timeout,
     )
+
+
+def warm_export(
+    name: str,
+    src_url: str,
+    *,
+    format: str | None = None,
+    readonly: bool = True,
+    server: str = "http://localhost:4040",
+    timeout: float = DEFAULT_TIMEOUT,
+) -> dict[str, Any]:
+    """Enqueue a warm: nbdmux fetches ``src_url`` via the configured
+    withcache, decompresses on the fly, and lands the raw .img under
+    ``<images-dir>/<name>.img``. Returns immediately with the
+    ``status='queued'`` record; caller polls :func:`list_exports`
+    (or watches the dashboard) for progress / ready.
+
+    ``format`` overrides the decompressor selector if the URL's
+    extension doesn't tell the story (``img`` / ``img.gz`` /
+    ``img.zst`` / ``img.xz``). Default: auto-derive from the URL.
+
+    Raises :class:`NbdmuxError` if ``NBDMUX_WITHCACHE_URL`` isn't
+    configured on the daemon, or on any HTTP failure.
+    """
+    body: dict[str, Any] = {"name": name, "src_url": src_url, "readonly": readonly}
+    if format is not None:
+        body["format"] = format
+    return _request("POST", server, "/exports", body=body, timeout=timeout)
 
 
 def list_exports(

@@ -126,43 +126,197 @@ class Auth:
 # --------------------------------------------------------------------------
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS exports (
-    name        TEXT PRIMARY KEY,
-    file        TEXT NOT NULL,
-    readonly    INTEGER NOT NULL DEFAULT 1,
-    added_at    TEXT NOT NULL
+    name           TEXT PRIMARY KEY,
+    -- Path on the nbdmux container's filesystem the decompressed
+    -- .img lands at. Convention: ``<data-dir>/images/<name>.img``
+    -- so the same dir can be bind-mounted into a sibling container
+    -- (e.g. bty-web) for cross-service visibility without duplication.
+    file           TEXT NOT NULL,
+    readonly       INTEGER NOT NULL DEFAULT 1,
+    -- State machine driven by the Warmer worker.
+    --   queued        -- enqueued; worker hasn't picked it up
+    --   fetching      -- streaming bytes from the upstream withcache
+    --   decompressing -- piping the bytes through gunzip / zstd into ``file``
+    --   ready         -- bytes on disk + export visible to nbd-server
+    --   failed        -- ``error`` column carries the reason; operator re-enqueues to retry
+    -- ``ready`` is the only state nbd-server's INI config includes.
+    -- Other states are visible in the dashboard + the JSON API but
+    -- the on-the-wire NBD listener won't surface them.
+    status         TEXT NOT NULL DEFAULT 'ready',
+    -- Upstream URL the Warmer pulls from (always routed through the
+    -- configured withcache; nbdmux refuses src_urls that don't have
+    -- ``NBDMUX_WITHCACHE_URL`` set). NULL when the operator
+    -- pre-populated ``file`` directly and POSTed just ``{name, file}``.
+    src_url        TEXT,
+    -- Decompressor selector. Auto-derived from ``src_url``'s suffix
+    -- when present (``.img`` -> raw / no decompression; ``.img.gz``
+    -- -> gunzip; ``.img.zst`` -> zstd). Operator can override via
+    -- the POST body's ``format`` field if the URL has no usable
+    -- extension.
+    format         TEXT,
+    bytes_total    INTEGER,        -- expected response size from upstream (Content-Length)
+    bytes_done     INTEGER,        -- decompressed bytes written to disk so far
+    error          TEXT,           -- populated when status='failed'
+    enqueued_at    TEXT NOT NULL,
+    started_at     TEXT,
+    completed_at   TEXT,
+    updated_at     TEXT NOT NULL
 );
 """
+
+
+_SCHEMA_VERSION = 2  # v0.2.0 adds the warming state-machine columns
 
 
 class Store:
     """Single-file SQLite store for the registered exports.
 
-    Schema is one table. WAL is fine here but we don't bother since
-    writes are rare (only on operator/bty register/unregister) and
-    reads are HTTP-handler-scoped; the global ``_DB_WRITE_LOCK``
-    serialises the writes.
+    Schema is one table plus a one-row version marker. WAL is fine
+    here but we don't bother since writes are rare (only on register
+    / unregister / worker state transitions) and reads are
+    HTTP-handler-scoped; the global ``_DB_WRITE_LOCK`` serialises
+    the writes.
+
+    Pre-1.0 schema policy: on a version mismatch the existing
+    ``state.db`` is rotated to ``state.db.v<N>.<ts>.bak`` and a
+    fresh schema is created. Operator state is regenerable
+    (operators re-POST their exports; bty-web does this
+    automatically when a machine boots ramboot), so an alpha-grade
+    migration apparatus would be over-engineering. The version
+    transition gets logged so a startup audit shows what happened.
     """
 
     def __init__(self, data_dir: str):
         os.makedirs(data_dir, exist_ok=True)
         self.db_path = os.path.join(data_dir, "state.db")
+        self._maybe_rotate_on_schema_mismatch()
         with self.conn() as c:
             c.executescript(_SCHEMA)
+            c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
+            c.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (_SCHEMA_VERSION,),
+            )
+
+    def _maybe_rotate_on_schema_mismatch(self) -> None:
+        """If state.db exists but its schema_version disagrees with
+        :data:`_SCHEMA_VERSION`, rotate it to a ``.bak`` so the
+        caller's ``executescript`` lands on an empty file. No-op when
+        the DB is missing or already on the current version."""
+        if not os.path.exists(self.db_path):
+            return
+        try:
+            with self.conn() as c:
+                row = c.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            current = int(row["version"]) if row is not None else 1
+        except sqlite3.OperationalError:
+            # ``schema_version`` table absent -> definitely pre-v0.2.0
+            current = 1
+        if current == _SCHEMA_VERSION:
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        bak = f"{self.db_path}.v{current}.{ts}.bak"
+        os.rename(self.db_path, bak)
+        for suffix in ("-journal", "-wal", "-shm"):
+            sidecar = f"{self.db_path}{suffix}"
+            if os.path.exists(sidecar):
+                os.unlink(sidecar)
+        sys.stderr.write(
+            f"nbdmux: schema v{current} -> v{_SCHEMA_VERSION}; rotated old state.db to {bak}\n"
+        )
 
     def conn(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.db_path, isolation_level=None)
         c.row_factory = sqlite3.Row
         return c
 
-    def record_export(self, name: str, file: str, readonly: bool = True) -> dict[str, Any]:
+    def upsert_export(
+        self,
+        name: str,
+        file: str,
+        readonly: bool = True,
+        *,
+        status: str = "ready",
+        src_url: str | None = None,
+        format: str | None = None,
+        bytes_total: int | None = None,
+    ) -> dict[str, Any]:
+        """Insert a new export or refresh an existing one.
+
+        Default status is ``ready`` so a pre-warmed-file POST (no
+        ``src_url``) lands directly servable. The Warmer flips the
+        status through the state machine when ``src_url`` is set.
+        """
+        now = now_iso()
         with _DB_WRITE_LOCK, self.conn() as c:
             c.execute(
-                "INSERT INTO exports (name, file, readonly, added_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(name) DO UPDATE SET file=excluded.file, "
-                "readonly=excluded.readonly, added_at=excluded.added_at",
-                (name, file, 1 if readonly else 0, now_iso()),
+                "INSERT INTO exports "
+                "(name, file, readonly, status, src_url, format, "
+                "bytes_total, bytes_done, enqueued_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "file=excluded.file, readonly=excluded.readonly, "
+                "status=excluded.status, src_url=excluded.src_url, "
+                "format=excluded.format, bytes_total=excluded.bytes_total, "
+                "bytes_done=0, error=NULL, started_at=NULL, "
+                "completed_at=CASE WHEN excluded.status='ready' "
+                "THEN excluded.enqueued_at ELSE NULL END, "
+                "updated_at=excluded.updated_at",
+                (
+                    name,
+                    file,
+                    1 if readonly else 0,
+                    status,
+                    src_url,
+                    format,
+                    bytes_total,
+                    now,
+                    now,
+                ),
             )
-        return {"name": name, "file": file, "readonly": readonly}
+        return self.get_export(name) or {}
+
+    def set_status(
+        self,
+        name: str,
+        status: str,
+        *,
+        error: str | None = None,
+        bytes_done: int | None = None,
+        bytes_total: int | None = None,
+        set_started: bool = False,
+        set_completed: bool = False,
+    ) -> None:
+        """Atomic status + companion-field update for the worker."""
+        now = now_iso()
+        sets: list[str] = ["status=?", "updated_at=?"]
+        params: list[Any] = [status, now]
+        if error is not None:
+            sets.append("error=?")
+            params.append(error)
+        if bytes_done is not None:
+            sets.append("bytes_done=?")
+            params.append(bytes_done)
+        if bytes_total is not None:
+            sets.append("bytes_total=?")
+            params.append(bytes_total)
+        if set_started:
+            sets.append("started_at=?")
+            params.append(now)
+        if set_completed:
+            sets.append("completed_at=?")
+            params.append(now)
+        params.append(name)
+        with _DB_WRITE_LOCK, self.conn() as c:
+            c.execute(
+                f"UPDATE exports SET {', '.join(sets)} WHERE name=?",
+                params,
+            )
+
+    def get_export(self, name: str) -> dict[str, Any] | None:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM exports WHERE name=?", (name,)).fetchone()
+        return _row_to_export(row) if row is not None else None
 
     def delete_export(self, name: str) -> bool:
         with _DB_WRITE_LOCK, self.conn() as c:
@@ -171,18 +325,312 @@ class Store:
 
     def list_exports(self) -> list[dict[str, Any]]:
         with self.conn() as c:
-            rows = c.execute(
-                "SELECT name, file, readonly, added_at FROM exports ORDER BY name"
-            ).fetchall()
+            rows = c.execute("SELECT * FROM exports ORDER BY name").fetchall()
+        return [_row_to_export(r) for r in rows]
+
+    def list_ready_exports(self) -> list[dict[str, Any]]:
+        """Subset visible to nbd-server: only ``status='ready'``."""
+        return [e for e in self.list_exports() if e["status"] == "ready"]
+
+    def list_pending_exports(self) -> list[dict[str, Any]]:
+        """Subset the Warmer resumes on startup: non-terminal states."""
         return [
-            {
-                "name": r["name"],
-                "file": r["file"],
-                "readonly": bool(r["readonly"]),
-                "added_at": r["added_at"],
-            }
-            for r in rows
+            e for e in self.list_exports() if e["status"] in ("queued", "fetching", "decompressing")
         ]
+
+
+def _row_to_export(row: sqlite3.Row) -> dict[str, Any]:
+    """Normalise a sqlite3.Row into the dict shape the JSON API + the
+    dashboard renderer expect. Booleans come back as bools, missing
+    columns as None, the ``progress`` shorthand is derived for the UI."""
+    bytes_total = row["bytes_total"]
+    bytes_done = row["bytes_done"] or 0
+    progress = None
+    if bytes_total and bytes_total > 0:
+        progress = round(min(100.0, (bytes_done * 100.0) / bytes_total), 1)
+    return {
+        "name": row["name"],
+        "file": row["file"],
+        "readonly": bool(row["readonly"]),
+        "status": row["status"],
+        "src_url": row["src_url"],
+        "format": row["format"],
+        "bytes_total": bytes_total,
+        "bytes_done": bytes_done,
+        "progress": progress,
+        "error": row["error"],
+        "enqueued_at": row["enqueued_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+# --------------------------------------------------------------------------
+# Warmer -- async fetch + decompress pipeline (one ref at a time)
+# --------------------------------------------------------------------------
+def _detect_format(src_url: str | None, override: str | None) -> str:
+    """Pick the decompressor for an export.
+
+    ``override`` from the POST body wins (so an operator can force
+    decompression of a URL whose extension is missing or misleading);
+    else derive from the URL suffix; else raw ``img`` as the default.
+    """
+    if override:
+        return override.lower()
+    if src_url:
+        lowered = src_url.lower()
+        if lowered.endswith(".img.gz") or lowered.endswith(".gz"):
+            return "img.gz"
+        if lowered.endswith(".img.zst") or lowered.endswith(".zst"):
+            return "img.zst"
+        if lowered.endswith(".img.xz") or lowered.endswith(".xz"):
+            return "img.xz"
+    return "img"
+
+
+def _resolve_withcache_url(src_url: str) -> str:
+    """Route ``src_url`` through the configured withcache. Returns the
+    URL the worker should HTTP-GET.
+
+    Contract: ``NBDMUX_WITHCACHE_URL`` MUST be set. nbdmux refuses to
+    pull from arbitrary upstreams; the only allowed bytes path is via
+    the operator's withcache, which gives a single auditable point of
+    LAN caching + outbound HTTP.
+
+    The withcache URL construction matches withcache's own ``/b/<b64(src)>``
+    shape: base64url-encode the canonical src URL into the path segment
+    so withcache can deduplicate on the canonical URL across rolling
+    tags / ``latest`` aliases.
+    """
+    base = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip().rstrip("/")
+    if not base:
+        raise ValueError(
+            "NBDMUX_WITHCACHE_URL is not set; nbdmux only pulls "
+            "via withcache. Configure the env var (or pre-populate the "
+            "file on disk and POST without src_url)."
+        )
+    encoded = _b64e(src_url.encode("utf-8"))
+    return f"{base}/b/{encoded}"
+
+
+class Warmer:
+    """Single-thread worker that walks each enqueued export through
+    fetch -> decompress -> ready. One in-flight job at a time so a
+    fleet of operators registering the same ref converges on a single
+    decompress pass rather than racing duplicates.
+
+    The state machine + persistence layer lives in :class:`Store`;
+    this class owns the in-process queue + the thread that drains it.
+    Re-enqueuing a ``ready`` ref is a no-op (Store.upsert_export
+    leaves the row at ``ready`` when called without a src_url).
+    Re-enqueuing a ``failed`` ref restarts at ``queued``.
+    """
+
+    def __init__(self, store: Store, nbd: NbdServer, images_dir: str):
+        self._store = store
+        self._nbd = nbd
+        self._images_dir = images_dir
+        self._queue: list[str] = []
+        self._cv = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._stop = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        os.makedirs(self._images_dir, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, name="nbdmux-warmer", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def enqueue(self, name: str) -> None:
+        """Drop ``name`` onto the work queue. The DB row should already
+        be in ``status='queued'``; the caller is responsible for the
+        Store.upsert_export call that creates it."""
+        with self._cv:
+            if name not in self._queue:
+                self._queue.append(name)
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._queue and not self._stop:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                name = self._queue.pop(0)
+            try:
+                self._process(name)
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"nbdmux: warmer crashed on {name}: {exc}\n")
+
+    def _process(self, name: str) -> None:
+        row = self._store.get_export(name)
+        if row is None:
+            sys.stderr.write(f"nbdmux: warmer: row vanished before pickup: {name}\n")
+            return
+        if row["status"] not in ("queued", "failed"):
+            sys.stderr.write(f"nbdmux: warmer: ref={name} status={row['status']}, skipping\n")
+            return
+        src_url = row["src_url"]
+        if not src_url:
+            self._store.set_status(
+                name,
+                "failed",
+                error="no src_url; can't warm",
+                set_started=True,
+                set_completed=True,
+            )
+            return
+        try:
+            fetch_url = _resolve_withcache_url(src_url)
+        except ValueError as exc:
+            self._store.set_status(
+                name,
+                "failed",
+                error=str(exc),
+                set_started=True,
+                set_completed=True,
+            )
+            return
+        format_hint = row["format"] or _detect_format(src_url, None)
+        dest = row["file"]
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        self._store.set_status(name, "fetching", set_started=True)
+        try:
+            written = self._fetch_and_decompress(name, fetch_url, dest, format_hint)
+        except Exception as exc:  # noqa: BLE001
+            for candidate in (dest, dest + ".inflight"):
+                with contextlib.suppress(OSError):
+                    os.unlink(candidate)
+            self._store.set_status(
+                name,
+                "failed",
+                error=f"{type(exc).__name__}: {exc}",
+                set_completed=True,
+            )
+            return
+        self._store.set_status(
+            name,
+            "ready",
+            bytes_done=written,
+            set_completed=True,
+        )
+        # Make the new ready row visible to nbd-server.
+        self._nbd.reload(self._store.list_ready_exports())
+
+    def _fetch_and_decompress(
+        self,
+        name: str,
+        url: str,
+        dest: str,
+        format_hint: str,
+    ) -> int:
+        """Stream ``url`` through the matching decompressor into
+        ``dest``. Returns the number of decompressed bytes written.
+
+        The fetch + decompress are pipelined via a subprocess that
+        reads gzip/zstd/xz from stdin and writes raw bytes to stdout;
+        urllib feeds the upstream response into the pipe so peak disk
+        is the destination file, not destination + an intermediate
+        compressed staging copy.
+
+        Progress is updated in the DB every ~5% so the dashboard's
+        progress bar advances without thrashing sqlite.
+        """
+        import urllib.request
+
+        tmp = dest + ".inflight"
+        with urllib.request.urlopen(url) as resp:  # noqa: S310
+            content_length = resp.headers.get("Content-Length")
+            bytes_total = int(content_length) if content_length else None
+            if bytes_total:
+                self._store.set_status(
+                    name,
+                    "fetching",
+                    bytes_total=bytes_total,
+                )
+            self._store.set_status(name, "decompressing")
+            proc: subprocess.Popen[bytes] | None
+            writer: Any
+            if format_hint in ("img", ""):
+                # No decompression -- just copy bytes.
+                proc = None
+                writer = open(tmp, "wb")  # noqa: SIM115
+            else:
+                cmd = _decompressor_cmd(format_hint)
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=open(tmp, "wb"),  # noqa: SIM115
+                    stderr=subprocess.PIPE,
+                )
+                writer = proc.stdin
+            assert writer is not None
+            try:
+                written = 0
+                last_progress_bucket = 0
+                chunk_size = 1024 * 1024
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    written += len(chunk)
+                    if bytes_total:
+                        bucket = int((written * 20) // bytes_total)
+                        if bucket > last_progress_bucket:
+                            last_progress_bucket = bucket
+                            self._store.set_status(
+                                name,
+                                "decompressing",
+                                bytes_done=written,
+                            )
+            finally:
+                if proc is not None:
+                    assert proc.stdin is not None
+                    proc.stdin.close()
+                    err = b""
+                    if proc.stderr is not None:
+                        err = proc.stderr.read()
+                    rc = proc.wait()
+                    if rc != 0:
+                        raise RuntimeError(f"decompressor exited rc={rc}: {err.decode('replace')}")
+                else:
+                    writer.close()
+        # The decompressed-size = the size on disk (after the
+        # decompressor wrote everything through).
+        final_size = os.path.getsize(tmp)
+        os.replace(tmp, dest)
+        self._store.set_status(name, "decompressing", bytes_done=final_size)
+        return final_size
+
+
+def _decompressor_cmd(format_hint: str) -> list[str]:
+    """Map a format hint to a stdin-to-stdout decompressor command.
+
+    Each of these reads compressed bytes from stdin and writes raw
+    bytes to stdout: ``gunzip -c`` / ``zstd -d -c`` / ``xz -d -c``.
+    The binaries are pulled in by the container; on a non-container
+    install the operator gets a friendly ``command not found`` from
+    the subprocess Popen call when the binary is missing.
+    """
+    if format_hint in ("img.gz", "gz", ".gz"):
+        return ["gunzip", "-c"]
+    if format_hint in ("img.zst", "zst", ".zst"):
+        return ["zstd", "-d", "-c"]
+    if format_hint in ("img.xz", "xz", ".xz"):
+        return ["xz", "-d", "-c"]
+    raise ValueError(f"unsupported format for nbdmux warm: {format_hint!r}")
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +771,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def nbd_port(self) -> int:
         return self.server.nbd_port  # type: ignore[attr-defined]
 
+    @property
+    def warmer(self) -> Warmer:
+        return self.server.warmer  # type: ignore[attr-defined]
+
+    @property
+    def images_dir(self) -> str:
+        return self.server.images_dir  # type: ignore[attr-defined]
+
     def log_message(self, format, *args):  # quieter, single-line
         print(f"{self.address_string()} - {format % args}", flush=True)
 
@@ -363,7 +819,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             name = urllib.parse.unquote(parsed.path[len("/exports/") :])
             existed = self.store.delete_export(name)
-            self.nbd.reload(self.store.list_exports())
+            self.nbd.reload(self.store.list_ready_exports())
             self.send_response(204 if existed else 404)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -382,29 +838,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.is_authed()
 
     def handle_post_export(self):
+        """Register or warm an export.
+
+        Two shapes accepted on POST /exports:
+
+        * ``{name, file, readonly?}``: pre-warmed; ``file`` is an
+          absolute path that already exists on disk. nbdmux records
+          it at ``status='ready'`` and SIGHUP-reloads nbd-server.
+        * ``{name, src_url, format?, readonly?}``: warm. nbdmux
+          allocates a path under ``<images-dir>/<name>.img``, marks
+          the row ``status='queued'``, and the Warmer worker fetches
+          via the configured withcache, decompresses, and flips to
+          ready. ``src_url`` is the canonical upstream URL; nbdmux
+          routes via ``$NBDMUX_WITHCACHE_URL``.
+
+        Either the ``file`` key or the ``src_url`` key must be set;
+        not both. ``name`` is the NBD-server export name, must be a
+        short identifier with no slashes (matches nbd-server's INI
+        rules).
+        """
         body = self._read_json()
         if not isinstance(body, dict):
             self.send_json(400, {"error": "body must be a JSON object"})
             return
         name = body.get("name")
         path = body.get("file")
+        src_url = body.get("src_url")
+        format_override = body.get("format")
         readonly = bool(body.get("readonly", True))
         if not isinstance(name, str) or not name.strip():
             self.send_json(400, {"error": "name: non-empty string required"})
             return
         if "/" in name or name.startswith(".") or len(name) > 64:
-            # nbd-server section names get used verbatim; reject
-            # anything that could escape the INI or trip the daemon.
             self.send_json(400, {"error": "name: must be a short identifier with no slashes"})
             return
-        if not isinstance(path, str) or not os.path.isabs(path):
-            self.send_json(400, {"error": "file: absolute path required"})
+        if (path is None) == (src_url is None):
+            self.send_json(
+                400,
+                {"error": "exactly one of {file, src_url} must be set"},
+            )
             return
-        if not os.path.isfile(path):
-            self.send_json(400, {"error": f"file: not found: {path}"})
+        if path is not None:
+            if not isinstance(path, str) or not os.path.isabs(path):
+                self.send_json(400, {"error": "file: absolute path required"})
+                return
+            if not os.path.isfile(path):
+                self.send_json(400, {"error": f"file: not found: {path}"})
+                return
+            record = self.store.upsert_export(
+                name,
+                path,
+                readonly=readonly,
+                status="ready",
+            )
+            self.nbd.reload(self.store.list_ready_exports())
+            self.send_json(200, record)
             return
-        record = self.store.record_export(name, path, readonly=readonly)
-        self.nbd.reload(self.store.list_exports())
+        if not isinstance(src_url, str) or not src_url.strip():
+            self.send_json(400, {"error": "src_url: non-empty string required"})
+            return
+        if (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() == "":
+            self.send_json(
+                400,
+                {
+                    "error": (
+                        "NBDMUX_WITHCACHE_URL is not configured; nbdmux "
+                        "only warms via withcache. Set the env var or "
+                        "pre-populate the file on disk and POST {name, file}."
+                    )
+                },
+            )
+            return
+        format_hint = _detect_format(src_url, format_override)
+        dest = os.path.join(self.images_dir, f"{name}.img")
+        record = self.store.upsert_export(
+            name,
+            dest,
+            readonly=readonly,
+            status="queued",
+            src_url=src_url,
+            format=format_hint,
+        )
+        self.warmer.enqueue(name)
         self.send_json(200, record)
 
     # -- operator UI -------------------------------------------------------
@@ -412,40 +927,77 @@ class Handler(http.server.BaseHTTPRequestHandler):
         exports = self.store.list_exports()
         host = self.headers.get("Host", "<host>").split(":", 1)[0]
         nbd_endpoint = f"tcp://{host}:{self.nbd_port}"
-        rows = (
-            "".join(
-                f"""<tr>
-                    <td><code>{html.escape(e["name"])}</code></td>
-                    <td class="mono"><small>{html.escape(e["file"])}</small></td>
-                    <td><small>{"ro" if e["readonly"] else "rw"}</small></td>
-                    <td><small>{html.escape(e["added_at"])}</small></td>
-                </tr>"""
-                for e in exports
-            )
-            or '<tr><td colspan="4"><em>No exports registered yet.</em></td></tr>'
+        withcache = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip()
+        rows = "".join(self._render_export_row(e) for e in exports) or (
+            '<tr><td colspan="5"><em>No exports registered yet.</em></td></tr>'
         )
         running = "running" if self.nbd.is_running() else "<strong>STOPPED</strong>"
+        upstream = (
+            f"upstream withcache: <code>{html.escape(withcache)}</code>"
+            if withcache
+            else "upstream withcache: <em>unset</em> (src_url warms disabled)"
+        )
         return f"""<!doctype html><html><head>
 <meta charset="utf-8"><title>nbdmux</title>
 <style>
-  body {{ font-family: system-ui, sans-serif; max-width: 60rem;
+  body {{ font-family: system-ui, sans-serif; max-width: 64rem;
          margin: 2rem auto; padding: 0 1rem; }}
   table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ border-bottom: 1px solid #ddd; padding: .4rem .5rem; text-align: left; }}
+  th, td {{ border-bottom: 1px solid #ddd; padding: .4rem .5rem; text-align: left;
+           vertical-align: top; }}
   .mono {{ font-family: ui-monospace, monospace; }}
   code {{ background: #f4f4f4; padding: 0 .2rem; border-radius: 3px; }}
+  .status-ready {{ color: #060; font-weight: 600; }}
+  .status-queued, .status-fetching, .status-decompressing {{ color: #06c; }}
+  .status-failed {{ color: #c00; font-weight: 600; }}
+  .bar {{ display: inline-block; width: 8rem; height: .5rem;
+         background: #eee; border-radius: .25rem; overflow: hidden;
+         vertical-align: middle; margin-right: .5rem; }}
+  .bar > span {{ display: block; height: 100%; background: #06c; }}
 </style>
 </head><body>
 <h1>nbdmux <small>{__version__}</small></h1>
 <p><small>nbd-server: {running} &middot; endpoint:
-<code>{html.escape(nbd_endpoint)}</code> &middot; {len(exports)} export(s)</small></p>
-<table><thead><tr><th>Name</th><th>File</th><th>Mode</th><th>Added</th></tr></thead>
+<code>{html.escape(nbd_endpoint)}</code> &middot; {len(exports)} export(s)
+&middot; {upstream}</small></p>
+<table><thead><tr>
+  <th>Name</th><th>File</th><th>Mode</th>
+  <th>Status</th><th>Added</th></tr></thead>
 <tbody>{rows}</tbody></table>
 <hr>
-<p><small>HTTP control: <code>POST /exports</code> /
+<p><small>HTTP control:
+<code>POST /exports {{name, file}}</code> (pre-warmed) or
+<code>POST /exports {{name, src_url}}</code> (warm via withcache) /
 <code>DELETE /exports/&lt;name&gt;</code> /
 <code>GET /exports</code>. See README for the wire format.</small></p>
 </body></html>"""
+
+    def _render_export_row(self, e: dict[str, Any]) -> str:
+        """One <tr> for an export. Renders progress bar + status pill
+        when the row is mid-warm; renders plain status text + the
+        completed timestamp when ready or failed."""
+        status = e.get("status") or "ready"
+        status_html = f'<span class="status-{html.escape(status)}">{html.escape(status)}</span>'
+        if status in ("fetching", "decompressing"):
+            pct = e.get("progress")
+            if pct is not None:
+                bar = f'<div class="bar"><span style="width:{pct:.1f}%"></span></div>{pct:.1f}%'
+            else:
+                bar = "<small><em>(streaming)</em></small>"
+            status_html = f"{status_html}<br>{bar}"
+        elif status == "failed":
+            err = html.escape(e.get("error") or "(no error message)")
+            status_html = f"{status_html}<br><small>{err}</small>"
+        ts_line = e.get("completed_at") or e.get("started_at") or e.get("enqueued_at") or "-"
+        return (
+            "<tr>"
+            f"<td><code>{html.escape(e['name'])}</code></td>"
+            f'<td class="mono"><small>{html.escape(e["file"])}</small></td>'
+            f"<td><small>{'ro' if e['readonly'] else 'rw'}</small></td>"
+            f"<td>{status_html}</td>"
+            f"<td><small>{html.escape(str(ts_line))}</small></td>"
+            "</tr>"
+        )
 
     def handle_login_form(self, error: str | None = None):
         if not self.auth.enabled:
@@ -561,10 +1113,17 @@ def main() -> int:
     p.add_argument("--nbd-port", type=int, default=10809, help="NBD listening port")
     p.add_argument("--bind", default="0.0.0.0", help="bind address (HTTP + NBD)")
     p.add_argument("--nbd-server-bin", default="nbd-server", help="nbd-server binary to spawn")
+    p.add_argument(
+        "--images-dir",
+        default=None,
+        help="where decompressed .img files land (default: <data-dir>/images)",
+    )
     args = p.parse_args()
 
     data_dir = os.path.abspath(args.data_dir)
     os.makedirs(data_dir, exist_ok=True)
+    images_dir = os.path.abspath(args.images_dir or os.path.join(data_dir, "images"))
+    os.makedirs(images_dir, exist_ok=True)
 
     secret = resolve_secret(data_dir)
     password = (os.environ.get("NBDMUX_ADMIN_PASSWORD") or "").strip() or None
@@ -575,22 +1134,42 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
+    withcache_url = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip()
+    if not withcache_url:
+        print(
+            "nbdmux: NBDMUX_WITHCACHE_URL unset; src_url-based warm requests "
+            "will be rejected. Pre-populated {name, file} POSTs still work.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     store = Store(data_dir)
     auth = Auth(secret, password)
     nbd = NbdServer(
         data_dir=data_dir, port=args.nbd_port, bind=args.bind, nbd_server_bin=args.nbd_server_bin
     )
-    nbd.start(store.list_exports())
+    # nbd-server only sees ``ready`` exports; in-flight + failed
+    # rows stay invisible to NBD clients but visible to the dashboard
+    # + the JSON API.
+    nbd.start(store.list_ready_exports())
+
+    warmer = Warmer(store=store, nbd=nbd, images_dir=images_dir)
+    warmer.start()
+    # Resume any rows that were mid-warm at the last shutdown.
+    for row in store.list_pending_exports():
+        warmer.enqueue(row["name"])
 
     httpd = _ThreadingHTTPServer((args.bind, args.port), Handler)
     httpd.store = store  # type: ignore[attr-defined]
     httpd.auth = auth  # type: ignore[attr-defined]
     httpd.nbd = nbd  # type: ignore[attr-defined]
     httpd.nbd_port = args.nbd_port  # type: ignore[attr-defined]
+    httpd.warmer = warmer  # type: ignore[attr-defined]
+    httpd.images_dir = images_dir  # type: ignore[attr-defined]
 
     def _shutdown(_signum, _frame):
         print("nbdmux: shutting down", file=sys.stderr, flush=True)
+        warmer.stop()
         nbd.stop()
         httpd.shutdown()
 
@@ -600,13 +1179,14 @@ def main() -> int:
     print(
         f"nbdmux: HTTP http://{args.bind}:{args.port}/ "
         f"NBD tcp://{args.bind}:{args.nbd_port}/ "
-        f"data={data_dir}",
+        f"data={data_dir} images={images_dir}",
         file=sys.stderr,
         flush=True,
     )
     try:
         httpd.serve_forever()
     finally:
+        warmer.stop()
         nbd.stop()
     return 0
 

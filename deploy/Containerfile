@@ -15,7 +15,15 @@ RUN apt-get update \
         python3 \
         python3-pip \
         ca-certificates \
+        gzip \
+        zstd \
+        xz-utils \
  && rm -rf /var/lib/apt/lists/*
+
+# gzip / zstd / xz-utils: the Warmer pipeline (v0.2.0+) pipes
+# upstream bytes through ``gunzip -c`` / ``zstd -d -c`` / ``xz -d -c``
+# while streaming into the decompressed .img on disk. gzip ships
+# baseline on trixie-slim but we pin it for clarity.
 
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE /app/
