@@ -53,6 +53,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+MIME_TYPES = {".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
+
+
 # --------------------------------------------------------------------------
 # Auth -- server-signed session cookie, password gate (withcache-pattern)
 # --------------------------------------------------------------------------
@@ -835,6 +839,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, self.store.list_exports())
         elif parsed.path == "/ui/login":
             self.handle_login_form()
+        elif parsed.path.startswith("/static/"):
+            self.serve_static(parsed)
         elif parsed.path == "/":
             if self.auth.enabled and not self.is_authed():
                 self.redirect("/ui/login")
@@ -842,6 +848,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_html(200, self.render_dash())
         else:
             self.send_text(404, "not found\n")
+
+    def serve_static(self, parsed):
+        """Serve files under ``src/nbdmux/static/`` (pico.min.css +
+        htmx.min.js). basename() blocks any ``..`` path traversal."""
+        name = os.path.basename(parsed.path)
+        path = os.path.join(STATIC_DIR, name)
+        if not name or not os.path.isfile(path):
+            self.send_text(404, "not found\n")
+            return
+        with open(path, "rb") as f:
+            data = f.read()
+        ext = os.path.splitext(name)[1]
+        self.send_response(200)
+        self.send_header("Content-Type", MIME_TYPES.get(ext, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def do_POST(self):
         parsed = urllib.parse.urlsplit(self.path)
@@ -967,6 +992,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(200, record)
 
     # -- operator UI -------------------------------------------------------
+    # Pico's default primary is a rich blue (#0172ad). nbdmux mirrors
+    # the same saturation/lightness at a hue shifted to purple so it
+    # reads as the intentional cousin of withcache's palette, not a
+    # random accent. Overriding --pico-primary in both themes covers
+    # buttons, focus rings, active tabs, links, and the progress bar.
+    _PALETTE = """\
+  :root {
+    --pico-primary: #6b1fa2;
+    --pico-primary-hover: #7d33b5;
+    --pico-primary-focus: rgba(107, 31, 162, .25);
+  }
+  [data-theme="dark"] {
+    --pico-primary: #b076e0;
+    --pico-primary-hover: #c090ea;
+    --pico-primary-focus: rgba(176, 118, 224, .3);
+  }
+"""
+
+    def _head(self, title: str) -> str:
+        return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<link rel="stylesheet" href="/static/pico.min.css">
+<script src="/static/htmx.min.js"></script>
+<style>
+{self._PALETTE}
+  main.container {{ max-width: 1100px; padding-top: 1rem; }}
+  h4 {{ margin-bottom: .4rem; }}
+  table {{ font-size: .9rem; margin-bottom: 0; }}
+  .url, .file {{ word-break: break-all; }}
+  .mono {{ font-family: var(--pico-font-family-monospace); font-size: .85em; }}
+  code {{ font-size: .85em; }}
+  .status-ready {{ color: #2e7d32; font-weight: 600; }}
+  .status-queued, .status-fetching, .status-decompressing {{
+      color: var(--pico-primary); font-weight: 600; }}
+  .status-failed {{ color: var(--pico-del-color, #c0392b); font-weight: 600; }}
+  progress.warm {{ width: 8rem; height: .5rem; margin: .25rem 0 .15rem; }}
+  .err {{ background: var(--pico-del-color, #c0392b); color: #fff;
+          padding: .7rem 1rem; border-radius: var(--pico-border-radius); margin-bottom: 1rem; }}
+  .stopped {{ color: var(--pico-del-color, #c0392b); font-weight: 600; }}
+</style>
+</head>"""
+
     def render_dash(self) -> str:
         exports = self.store.list_exports()
         host = self.headers.get("Host", "<host>").split(":", 1)[0]
@@ -975,46 +1044,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rows = "".join(self._render_export_row(e) for e in exports) or (
             '<tr><td colspan="5"><em>No exports registered yet.</em></td></tr>'
         )
-        running = "running" if self.nbd.is_running() else "<strong>STOPPED</strong>"
+        running = "running" if self.nbd.is_running() else '<span class="stopped">STOPPED</span>'
         upstream = (
             f"upstream withcache: <code>{html.escape(withcache)}</code>"
             if withcache
             else "upstream withcache: <em>unset</em> (src_url warms disabled)"
         )
-        return f"""<!doctype html><html><head>
-<meta charset="utf-8"><title>nbdmux</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; max-width: 64rem;
-         margin: 2rem auto; padding: 0 1rem; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ border-bottom: 1px solid #ddd; padding: .4rem .5rem; text-align: left;
-           vertical-align: top; }}
-  .mono {{ font-family: ui-monospace, monospace; }}
-  code {{ background: #f4f4f4; padding: 0 .2rem; border-radius: 3px; }}
-  .status-ready {{ color: #060; font-weight: 600; }}
-  .status-queued, .status-fetching, .status-decompressing {{ color: #06c; }}
-  .status-failed {{ color: #c00; font-weight: 600; }}
-  .bar {{ display: inline-block; width: 8rem; height: .5rem;
-         background: #eee; border-radius: .25rem; overflow: hidden;
-         vertical-align: middle; margin-right: .5rem; }}
-  .bar > span {{ display: block; height: 100%; background: #06c; }}
-</style>
-</head><body>
-<h1>nbdmux <small>{__version__}</small></h1>
-<p><small>nbd-server: {running} &middot; endpoint:
-<code>{html.escape(nbd_endpoint)}</code> &middot; {len(exports)} export(s)
-&middot; {upstream}</small></p>
-<table><thead><tr>
-  <th>Name</th><th>File</th><th>Mode</th>
-  <th>Status</th><th>Added</th></tr></thead>
-<tbody>{rows}</tbody></table>
-<hr>
-<p><small>HTTP control:
-<code>POST /exports {{name, file}}</code> (pre-warmed) or
-<code>POST /exports {{name, src_url}}</code> (warm via withcache) /
-<code>DELETE /exports/&lt;name&gt;</code> /
-<code>GET /exports</code>. See README for the wire format.</small></p>
-</body></html>"""
+        logout = (
+            '<li><form method="post" action="/ui/logout" style="margin:0">'
+            '<button type="submit" class="secondary outline" '
+            'style="width:auto;padding:.3rem .8rem">Log out</button></form></li>'
+            if self.auth.enabled and hasattr(self, "handle_logout")
+            else ""
+        )
+        return f"""{self._head("nbdmux")}
+<body><main class="container">
+  <nav>
+    <ul><li>
+      <strong>nbdmux</strong>
+      &nbsp;<small class="mono">v{html.escape(__version__)}</small>
+    </li></ul>
+    <ul>{logout}</ul>
+  </nav>
+  <p><small>nbd-server: {running} &middot; endpoint:
+  <code>{html.escape(nbd_endpoint)}</code> &middot; {len(exports)} export(s)
+  &middot; {upstream}</small></p>
+  <table><thead><tr>
+    <th>Name</th><th>File</th><th>Mode</th>
+    <th>Status</th><th>Added</th></tr></thead>
+  <tbody>{rows}</tbody></table>
+  <hr>
+  <p><small>HTTP control:
+  <code>POST /exports {{name, file}}</code> (pre-warmed) or
+  <code>POST /exports {{name, src_url}}</code> (warm via withcache) /
+  <code>DELETE /exports/&lt;name&gt;</code> /
+  <code>GET /exports</code>. See README for the wire format.</small></p>
+</main></body></html>"""
 
     def _render_export_row(self, e: dict[str, Any]) -> str:
         """One <tr> for an export. Renders progress bar + status pill
@@ -1025,9 +1090,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if status in ("fetching", "decompressing"):
             pct = e.get("progress")
             if pct is not None:
-                bar = f'<div class="bar"><span style="width:{pct:.1f}%"></span></div>{pct:.1f}%'
+                bar = (
+                    f'<progress class="warm" value="{pct:.1f}" max="100"></progress>'
+                    f" <small>{pct:.1f}%</small>"
+                )
             else:
-                bar = "<small><em>(streaming)</em></small>"
+                bar = '<progress class="warm"></progress> <small><em>streaming</em></small>'
             status_html = f"{status_html}<br>{bar}"
         elif status == "failed":
             err = html.escape(e.get("error") or "(no error message)")
@@ -1036,7 +1104,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return (
             "<tr>"
             f"<td><code>{html.escape(e['name'])}</code></td>"
-            f'<td class="mono"><small>{html.escape(e["file"])}</small></td>'
+            f'<td class="file mono"><small>{html.escape(e["file"])}</small></td>'
             f"<td><small>{'ro' if e['readonly'] else 'rw'}</small></td>"
             f"<td>{status_html}</td>"
             f"<td><small>{html.escape(str(ts_line))}</small></td>"
@@ -1047,19 +1115,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.auth.enabled:
             self.redirect("/")
             return
-        err = f'<p style="color:#c00"><small>{html.escape(error)}</small></p>' if error else ""
-        body_style = "font-family:system-ui;max-width:24rem;margin:5rem auto"
+        err = f'<div class="err">{html.escape(error)}</div>' if error else ""
         self.send_html(
             200 if not error else 401,
-            f"""<!doctype html><html><body style="{body_style}">
-<h2>nbdmux</h2>{err}
-<form method="post" action="/ui/login">
-  <label>Password
-    <input type="password" name="password" autofocus required style="width:100%">
-  </label>
-  <button type="submit" style="margin-top:1rem">Sign in</button>
-</form>
-</body></html>""",
+            f"""{self._head("nbdmux - login")}
+<body><main class="container">
+  <article style="max-width: 24rem; margin: 4rem auto;">
+    <hgroup>
+      <h2>nbdmux <small class="mono">v{html.escape(__version__)}</small></h2>
+      <p>operator login</p>
+    </hgroup>
+    {err}
+    <form method="post" action="/ui/login">
+      <input type="password" name="password" placeholder="Admin password" autofocus required>
+      <button type="submit">Log in</button>
+    </form>
+  </article>
+</main></body></html>""",
         )
 
     def handle_login_submit(self):
