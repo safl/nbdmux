@@ -4,6 +4,7 @@ No third-party deps; src/ is put on the path so the package imports
 without an install.
 """
 
+import http.client
 import http.server
 import json
 import os
@@ -14,6 +15,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -345,6 +347,134 @@ class TestAuthGate(unittest.TestCase):
 
     def test_healthz_is_open(self):
         urllib.request.urlopen(self.base + "/healthz").read()  # 200, no auth header
+
+
+# --------------------------------------------------------------------------
+# /admin/create_export -- the New Export subnav form
+# --------------------------------------------------------------------------
+def _post_form(host: str, port: int, path: str, form: dict) -> tuple[int, str | None]:
+    """POST a form-encoded body without following redirects; the form
+    handler always answers with a 303 and urllib would silently follow
+    it, hiding the Location value that the tests are verifying.
+    Returns ``(status, location)``; the response body is discarded."""
+    body = urllib.parse.urlencode(form)
+    conn = http.client.HTTPConnection(host, port)
+    try:
+        conn.request(
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        resp = conn.getresponse()
+        location = resp.getheader("Location")
+        status = resp.status
+        resp.read()
+        return status, location
+    finally:
+        conn.close()
+
+
+class TestCreateExportForm(unittest.TestCase):
+    """POST /admin/create_export is the operator-visible create path
+    (New Export subnav). Verifies redirects, validation, and store
+    state; no auth (open mode)."""
+
+    def setUp(self):
+        self.httpd, self.store, self.nbd = _start_nbdmux()
+        self.host = "127.0.0.1"
+        self.port = self.httpd.server_address[1]
+        self._saved = os.environ.get("NBDMUX_WITHCACHE_URL")
+        os.environ["NBDMUX_WITHCACHE_URL"] = "http://withcache-test:8081"
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        else:
+            os.environ["NBDMUX_WITHCACHE_URL"] = self._saved
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_valid_form_creates_queued_export_and_303s(self):
+        status, location = _post_form(
+            self.host,
+            self.port,
+            "/admin/create_export",
+            {"name": "demo", "src_url": "https://example/demo.img.zst"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/")
+        rows = self.store.list_exports()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "demo")
+        self.assertEqual(rows[0]["status"], "queued")
+        self.assertEqual(rows[0]["src_url"], "https://example/demo.img.zst")
+
+    def test_empty_name_redirects_with_err(self):
+        status, location = _post_form(
+            self.host,
+            self.port,
+            "/admin/create_export",
+            {"name": "", "src_url": "https://example/demo.img"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/?err=name")
+        self.assertEqual(self.store.list_exports(), [])
+
+    def test_slash_in_name_redirects_with_err(self):
+        status, location = _post_form(
+            self.host,
+            self.port,
+            "/admin/create_export",
+            {"name": "foo/bar", "src_url": "https://example/demo.img"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/?err=name")
+
+    def test_missing_src_url_redirects_with_err(self):
+        status, location = _post_form(
+            self.host,
+            self.port,
+            "/admin/create_export",
+            {"name": "demo", "src_url": ""},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/?err=src_url")
+
+    def test_withcache_unset_redirects_with_err(self):
+        os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        status, location = _post_form(
+            self.host,
+            self.port,
+            "/admin/create_export",
+            {"name": "demo", "src_url": "https://example/demo.img.zst"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/?err=withcache_unset")
+
+
+class TestCreateExportFormAuthGate(unittest.TestCase):
+    """With NBDMUX_ADMIN_PASSWORD set, POST /admin/create_export must
+    require a session cookie; without one, redirect to /ui/login."""
+
+    def setUp(self):
+        self.httpd, _, _ = _start_nbdmux(password="letmein")
+        self.host = "127.0.0.1"
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_unauth_redirects_to_login(self):
+        status, location = _post_form(
+            self.host,
+            self.port,
+            "/admin/create_export",
+            {"name": "demo", "src_url": "https://x/y.img"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/ui/login")
 
 
 # --------------------------------------------------------------------------
