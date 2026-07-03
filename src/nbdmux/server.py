@@ -1033,6 +1033,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   .err {{ background: var(--pico-del-color, #c0392b); color: #fff;
           padding: .7rem 1rem; border-radius: var(--pico-border-radius); margin-bottom: 1rem; }}
   .stopped {{ color: var(--pico-del-color, #c0392b); font-weight: 600; }}
+  .idle {{ color: var(--pico-muted-color); font-weight: 600; }}
 </style>
 </head>"""
 
@@ -1044,7 +1045,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rows = "".join(self._render_export_row(e) for e in exports) or (
             '<tr><td colspan="5"><em>No exports registered yet.</em></td></tr>'
         )
-        running = "running" if self.nbd.is_running() else '<span class="stopped">STOPPED</span>'
+        # Distinguish "process is intentionally down because there's
+        # nothing to serve yet" from "process was up and crashed".
+        # Zero ready exports + zero registered rows = deferred by
+        # design (nbd-server refuses to launch with an empty INI); paint
+        # it as neutral "idle" so operators don't triage a non-issue.
+        ready = [e for e in exports if (e.get("status") or "ready") == "ready"]
+        if self.nbd.is_running():
+            running = "running"
+        elif not ready:
+            running = (
+                '<span class="idle">idle</span>'
+                " <small><em>(starts on first ready export)</em></small>"
+            )
+        else:
+            running = '<span class="stopped">STOPPED</span>'
         upstream = (
             f"upstream withcache: <code>{html.escape(withcache)}</code>"
             if withcache
