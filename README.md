@@ -24,7 +24,7 @@ container, no third-party Python deps. Operationally:
 
 | Path                       | What it is                                                              |
 |----------------------------|-------------------------------------------------------------------------|
-| `src/nbdmux/server.py`     | The daemon. HTTP control plane + nbd-server subprocess management + operator UI |
+| `src/nbdmux/server.py`     | The daemon. HTTP control plane + nbd-server subprocess management + operator UI (Bootstrap 5 + Bootstrap Icons + HTMX, matches bty's chrome) |
 | `src/nbdmux/client.py`     | Stdlib-only Python client library for other tools                           |
 | `deploy/Containerfile`     | Single-image deploy (Python + nbd-server)                                   |
 | `deploy/compose.yml`       | Reference compose stack                                                 |
@@ -77,13 +77,34 @@ fdisk -l /dev/nbd0   # the .img's partition table
 
 ## HTTP control plane
 
-| Method | Path                | Body                                          | Returns        |
-|--------|---------------------|-----------------------------------------------|----------------|
-| GET    | `/exports`          | -                                             | array of exports |
-| POST   | `/exports`          | `{name, file, readonly?: bool}`               | the new export |
-| DELETE | `/exports/{name}`   | -                                             | 204            |
-| GET    | `/healthz`          | -                                             | `ok`           |
-| GET    | `/`                 | -                                             | operator dashboard |
+| Method | Path                     | Body                                          | Returns        |
+|--------|--------------------------|-----------------------------------------------|----------------|
+| GET    | `/exports`               | -                                             | array of exports |
+| POST   | `/exports`               | `{name, file, readonly?: bool}` (pre-warmed) OR `{name, src_url}` (warm via withcache) | the new export |
+| DELETE | `/exports/{name}`        | -                                             | 204 (warm-created also unlinks the .img) |
+| POST   | `/admin/create_export`   | form-encoded `name=...&src_url=...`           | 303 to `/` (dashboard) |
+| GET    | `/healthz`               | -                                             | `ok`           |
+| GET    | `/`                      | -                                             | operator dashboard |
+
+`POST /admin/create_export` is what the operator UI's New Export
+subnav form submits to; it's the form-encoded counterpart of the
+JSON `POST /exports {name, src_url}` warm path. Validation
+failures 303 back to `/?err=<kind>` and the dashboard renders an
+alert banner with a friendly reason.
+
+## Operator UI
+
+The dashboard at `http://<host>:8082/` is a one-page view of the
+nbd-server process, all registered exports, and (top-right of the
+sub-navigation strip) a New Export form. It uses Bootstrap 5 +
+Bootstrap Icons + HTMX bundled offline; the same chrome as bty and
+withcache, only the primary hue differs (magenta -- the terminus of
+the trio's navy -> dark-magenta -> magenta gradient) so operators
+tell the three consoles apart at a glance.
+
+Login is a signed session cookie gated on `NBDMUX_ADMIN_PASSWORD`
+(same pattern as withcache). With no password set, the UI is open
+and the daemon logs a startup warning.
 
 ## Auth
 
