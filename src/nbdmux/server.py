@@ -1301,8 +1301,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
   <li class="nav-item"><a class="nav-link active" href="#exports">Exports</a></li>
 </ul>
 <div class="subnav-actions ms-auto d-flex align-items-center">
-  <form hx-post="/admin/create_export" hx-target="body" hx-swap="outerHTML"
-        hx-indicator="#spin" class="m-0 d-flex align-items-center gap-1">
+  <form method="post" action="/admin/create_export"
+        class="m-0 d-flex align-items-center gap-1">
     <label for="new-name" class="text-muted small mb-0">name</label>
     <input class="form-control form-control-sm" id="new-name" name="name"
            style="width: 10rem;" placeholder="debian-13" required{create_disabled}>
@@ -1312,7 +1312,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
     <button class="btn btn-sm btn-primary ms-1" type="submit"{create_disabled}
             >Add</button>
   </form>
-  <progress id="spin" class="htmx-indicator ms-2" style="width:5rem;height:.4rem;"></progress>
 </div>"""
         return f"""{self._head("nbdmux")}
 {self._chrome_open(brand_active=True, subnav_html=subnav_html)}
