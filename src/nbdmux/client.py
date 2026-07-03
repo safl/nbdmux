@@ -26,6 +26,7 @@ __all__ = [
     "NbdmuxError",
     "add_export",
     "control_base",
+    "is_healthy",
     "list_exports",
     "remove_export",
     "warm_export",
