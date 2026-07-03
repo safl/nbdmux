@@ -18,7 +18,7 @@ nbd-server``; Fedora: ``dnf install nbd``).
 
 from .client import add_export, list_exports, remove_export, warm_export
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = [
     "__version__",
