@@ -1255,11 +1255,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
 {subnav}
 </div>"""
 
+    _ERR_MESSAGES: dict[str, str] = {
+        "name": "Name is required; no '/' characters, must not start with '.', max 64 chars.",
+        "src_url": "Source URL is required.",
+        "withcache_unset": (
+            "NBDMUX_WITHCACHE_URL is not configured; nbdmux cannot warm the "
+            "export. Set the env var and restart, or POST /exports with a "
+            "pre-warmed {name, file} pair."
+        ),
+    }
+
     def render_dash(self) -> str:
         exports = self.store.list_exports()
         host = self.headers.get("Host", "<host>").split(":", 1)[0]
         nbd_endpoint = f"tcp://{host}:{self.nbd_port}"
         withcache = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip()
+        # ``?err=<kind>`` is the signal handle_create_export_form uses
+        # to send the operator back to the dashboard with a reason.
+        # Render an alert banner above the nbd-server card so the
+        # form failure is visible instead of a silent no-op redirect.
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        err_kind = (query.get("err") or [""])[0]
+        err_banner = ""
+        if err_kind:
+            msg = self._ERR_MESSAGES.get(err_kind, f"Create export failed: {err_kind}.")
+            # Non-dismissible: only bootstrap-icons + htmx are bundled
+            # (see /static assets in _head); bootstrap.bundle.js is not,
+            # so ``data-bs-dismiss`` would no-op. The banner clears on
+            # the next full-page navigation (form submit or refresh).
+            err_banner = (
+                '<div class="alert alert-danger" role="alert">'
+                '<i class="bi bi-exclamation-triangle-fill me-1"></i>'
+                f"{html.escape(msg)}"
+                "</div>"
+            )
         rows = "".join(self._render_export_row(e) for e in exports) or (
             '<tr><td colspan="5" class="text-center text-muted">'
             "<em>No exports registered yet.</em></td></tr>"
@@ -1316,6 +1345,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return f"""{self._head("nbdmux")}
 {self._chrome_open(brand_active=True, subnav_html=subnav_html)}
 <main class="container py-4">
+  {err_banner}
   <div class="card mb-4">
     <div class="card-header d-flex align-items-center justify-content-between">
       <span><i class="bi bi-broadcast text-primary"></i> nbd-server</span>
@@ -1410,10 +1440,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """UI create-export: reads form-encoded ``{name, src_url}``,
         forwards through the same validation the JSON POST ``/exports``
         uses, then 303-redirects back to ``/`` so the browser flips
-        into GET and the dashboard shows the new queued row. Errors
-        redirect back with the reason in a ?err= query so the shell
-        page can (in a future pass) surface them; for MVP the row
-        will show ``failed`` with the message on the next render."""
+        into GET and the dashboard shows the new queued row.
+        Validation failures 303 back to ``/?err=<kind>`` with the
+        reason; ``render_dash`` reads the query and renders an
+        alert banner above the nbd-server card so the operator
+        sees why nothing was created."""
         form = self.read_form()
         name = form.get("name", "").strip()
         src_url = form.get("src_url", "").strip()
