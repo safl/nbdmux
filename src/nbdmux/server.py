@@ -1228,6 +1228,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
+PROBE_EXPORT_NAME = "probe"
+PROBE_EXPORT_SIZE = 1 << 20  # 1 MiB -- small on disk, big enough to `dd` against
+
+
+def _ensure_probe_export(store: Store, data_dir: str) -> None:
+    """Guarantee a ``probe`` export is registered ``ready`` so
+    nbd-server has something to serve on daemon start, regardless of
+    whether any operator has POSTed a real export yet.
+
+    Two things this buys us:
+
+    * ``nbd-server`` runs unconditionally, so the "STOPPED" state is
+      an actual signal (the process crashed or refused to start) and
+      not a design-time deferred idle.
+    * Operators get a permanent smoke-test target -- ``qemu-nbd -c
+      /dev/nbd0 nbd://<host>:10809/probe`` should always answer, so
+      "does the whole warm -> serve pipeline work end-to-end?"
+      collapses to a single command that doesn't require an image
+      to be POSTed first.
+
+    File contents: a 1 MiB payload starting with a magic banner
+    string (version-stamped) padded with zeros. Read-only. Written
+    idempotently: only regenerated if the file is missing OR its
+    size drifted (e.g. someone truncated it) OR the banner version
+    differs (so a nbdmux upgrade refreshes the marker).
+    """
+    path = os.path.join(data_dir, "probe.img")
+    banner = f"NBDMUX PROBE v{__version__}\n".encode("ascii")
+    need_write = True
+    if os.path.isfile(path) and os.path.getsize(path) == PROBE_EXPORT_SIZE:
+        with open(path, "rb") as f:
+            head = f.read(len(banner))
+        if head == banner:
+            need_write = False
+    if need_write:
+        # Write via a tempfile + rename so a crashed writer never
+        # leaves a half-formed probe.img that would fail nbd-server
+        # startup on the next boot.
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(banner)
+            f.write(b"\x00" * (PROBE_EXPORT_SIZE - len(banner)))
+        os.replace(tmp, path)
+    store.upsert_export(
+        name=PROBE_EXPORT_NAME,
+        file=path,
+        readonly=True,
+        status="ready",
+    )
+
+
 # --------------------------------------------------------------------------
 # main / wiring
 # --------------------------------------------------------------------------
@@ -1279,6 +1330,7 @@ def main() -> int:
     nbd = NbdServer(
         data_dir=data_dir, port=args.nbd_port, bind=args.bind, nbd_server_bin=args.nbd_server_bin
     )
+    _ensure_probe_export(store, data_dir)
     # nbd-server only sees ``ready`` exports; in-flight + failed
     # rows stay invisible to NBD clients but visible to the dashboard
     # + the JSON API.

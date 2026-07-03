@@ -11,6 +11,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -91,6 +92,56 @@ class TestStore(unittest.TestCase):
         self.store.upsert_export("b", "/tmp/b.img")
         names = [e["name"] for e in self.store.list_exports()]
         self.assertEqual(names, ["a", "b", "c"])
+
+
+class TestEnsureProbeExport(unittest.TestCase):
+    """The always-on ``probe`` export gives nbd-server something to
+    serve unconditionally (so its subprocess is always up + STOPPED
+    stays a real signal) and gives operators a smoke-test target
+    (``qemu-nbd nbd://host:10809/probe`` should always answer)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = server.Store(self.tmpdir)
+
+    def test_probe_file_created_and_registered(self):
+        server._ensure_probe_export(self.store, self.tmpdir)
+        probe_path = os.path.join(self.tmpdir, "probe.img")
+        self.assertTrue(os.path.isfile(probe_path))
+        self.assertEqual(os.path.getsize(probe_path), server.PROBE_EXPORT_SIZE)
+        # Banner at head so an operator dd-ing the export sees a
+        # human-readable marker before the zero-pad.
+        with open(probe_path, "rb") as f:
+            head = f.read(64)
+        self.assertTrue(head.startswith(b"NBDMUX PROBE v"))
+        rows = self.store.list_exports()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], server.PROBE_EXPORT_NAME)
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertTrue(rows[0]["readonly"])
+
+    def test_probe_is_idempotent(self):
+        """A second call must not rewrite the file (spares an IO
+        round-trip on every daemon start) or duplicate the row."""
+        server._ensure_probe_export(self.store, self.tmpdir)
+        probe_path = os.path.join(self.tmpdir, "probe.img")
+        first_mtime = os.path.getmtime(probe_path)
+        time.sleep(0.05)  # mtime resolution guard
+        server._ensure_probe_export(self.store, self.tmpdir)
+        second_mtime = os.path.getmtime(probe_path)
+        self.assertEqual(first_mtime, second_mtime)
+        self.assertEqual(len(self.store.list_exports()), 1)
+
+    def test_probe_regenerates_when_truncated(self):
+        """If someone truncated probe.img, the next daemon start must
+        rewrite it (else nbd-server would export a bad-sized file
+        that fails client reads at the tail)."""
+        server._ensure_probe_export(self.store, self.tmpdir)
+        probe_path = os.path.join(self.tmpdir, "probe.img")
+        with open(probe_path, "wb") as f:
+            f.write(b"short")
+        server._ensure_probe_export(self.store, self.tmpdir)
+        self.assertEqual(os.path.getsize(probe_path), server.PROBE_EXPORT_SIZE)
 
 
 # --------------------------------------------------------------------------
