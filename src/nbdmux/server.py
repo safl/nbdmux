@@ -1021,21 +1021,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(200, record)
 
     # -- operator UI -------------------------------------------------------
-    # bty ships a Bootstrap 5 stack (bootstrap.min.css +
-    # bootstrap-icons.min.css + htmx). All three ecosystem services
-    # (bty, nbdmux, withcache) share that stack so operators only
-    # learn one UI grammar; the primary hue is what tells them
-    # which service they're on. The trio sits on a
-    # navy -> dark-magenta -> magenta gradient (cool -> hot); nbdmux
-    # is the magenta terminus (the visible runtime that clients
-    # actually connect to over the NBD wire).
-    # Palette: nbdmux is the magenta terminus of the trio's
-    # navy -> dark-magenta -> magenta gradient (bty navy, withcache
-    # dark-magenta, nbdmux magenta). Only ``--bs-primary`` differs
-    # between the three services -- the page chrome (accent strip,
-    # sticky header, dark navbar, brand pill, user-bar) is shared
-    # verbatim so operators moving between the three consoles only
-    # learn one UI grammar.
+    # All three ecosystem services (bty, nbdmux, withcache) share a
+    # Bootstrap 5 + Bootstrap Icons + htmx stack and the same page
+    # chrome (accent strip, sticky header, dark navbar, brand pill,
+    # user-bar); only ``--bs-primary`` differs so operators moving
+    # between the three consoles learn one UI grammar. The trio sits
+    # on a navy -> dark-magenta -> magenta gradient (cool -> hot);
+    # nbdmux is the magenta terminus (the visible runtime that
+    # clients actually connect to over the NBD wire).
     _PRIMARY_HEX = "#d63384"  # magenta -- Bootstrap --bs-pink
     _PRIMARY_HOVER = "#c02576"
     _PRIMARY_RGB = "214, 51, 132"
