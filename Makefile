@@ -1,11 +1,11 @@
 # nbdmux -- common tasks (and the home of the CI logic: the GitHub workflows
 # call these targets, so everything CI does is reproducible locally).
 # Run `make` for the list. Override vars on the CLI, e.g.
-#   make serve PORT=4040            make bump VERSION=0.2.0
+#   make serve PORT=8082            make bump VERSION=0.2.0
 PYTHON    ?= python3
 RUFF      ?= ruff
 PRECOMMIT ?= pre-commit
-PORT      ?= 4040
+PORT      ?= 8082
 NBD_PORT  ?= 10809
 # Containerized deploy: prefer podman, fall back to docker.
 COMPOSE   ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker) compose
