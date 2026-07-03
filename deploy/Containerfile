@@ -4,7 +4,7 @@
 # Run:    see deploy/compose.yml for the production shape.
 #
 # Two ports:
-#   4040   HTTP control plane + operator UI
+#   8082   HTTP control plane + operator UI
 #  10809   NBD (nbd-server)
 
 FROM debian:trixie-slim
@@ -41,11 +41,11 @@ VOLUME ["/data"]
 # registers.
 VOLUME ["/images"]
 
-EXPOSE 4040 10809
+EXPOSE 8082 10809
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s \
     CMD python3 -c "import urllib.request, sys; \
-        sys.exit(0 if urllib.request.urlopen('http://localhost:4040/healthz', timeout=2).status == 200 else 1)"
+        sys.exit(0 if urllib.request.urlopen('http://localhost:8082/healthz', timeout=2).status == 200 else 1)"
 
 ENTRYPOINT ["nbdmux-server"]
-CMD ["--data-dir", "/data", "--port", "4040", "--nbd-port", "10809"]
+CMD ["--data-dir", "/data", "--port", "8082", "--nbd-port", "10809"]
