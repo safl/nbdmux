@@ -47,7 +47,7 @@ class NbdmuxError(Exception):
 def control_base(server: str) -> str:
     """Normalise a server value to ``http://<host>:<port>``.
 
-    Accepts ``host``, ``host:4040``, or ``http://host:4040``. The
+    Accepts ``host``, ``host:8082``, or ``http://host:8082``. The
     trailing slash is stripped. Mirrors ``withcache.client.cache_base``
     in shape so consumers configuring both services can use the same
     helper convention.
@@ -102,7 +102,7 @@ def add_export(
     file: str,
     *,
     readonly: bool = True,
-    server: str = "http://localhost:4040",
+    server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Register a pre-warmed file as a named NBD export.
@@ -132,7 +132,7 @@ def warm_export(
     *,
     format: str | None = None,
     readonly: bool = True,
-    server: str = "http://localhost:4040",
+    server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Enqueue a warm: nbdmux fetches ``src_url`` via the configured
@@ -155,7 +155,7 @@ def warm_export(
 
 
 def list_exports(
-    server: str = "http://localhost:4040",
+    server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
 ) -> list[dict[str, Any]]:
     """Return the current set of registered exports as a list of records.
@@ -167,7 +167,7 @@ def list_exports(
 
 def remove_export(
     name: str,
-    server: str = "http://localhost:4040",
+    server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
 ) -> None:
     """Unregister an export by name. 404 (no such export) is treated
@@ -185,7 +185,7 @@ def remove_export(
 
 
 def is_healthy(
-    server: str = "http://localhost:4040",
+    server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
 ) -> bool:
     """True iff ``GET /healthz`` returns 200. Suitable for a startup probe.

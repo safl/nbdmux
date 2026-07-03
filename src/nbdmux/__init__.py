@@ -5,7 +5,7 @@ Two surfaces:
 - ``nbdmux-server`` (``nbdmux.server:main``) -- the daemon. Manages an
   ``nbd-server`` subprocess that exposes registered local files as
   named NBD exports on a TCP port (default 10809). Operator dashboard
-  + HTTP control API on a separate port (default 4040).
+  + HTTP control API on a separate port (default 8082).
 - ``nbdmux.client`` -- a tiny stdlib-only library for other tools
   (e.g. bty) to register / list / unregister exports without
   reimplementing the HTTP API.
@@ -18,7 +18,7 @@ nbd-server``; Fedora: ``dnf install nbd``).
 
 from .client import add_export, list_exports, remove_export, warm_export
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 
 __all__ = [
     "__version__",

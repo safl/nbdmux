@@ -1343,7 +1343,7 @@ def main() -> int:
     summary = (__doc__ or "nbdmux daemon").splitlines()[0]
     p = argparse.ArgumentParser(prog="nbdmux-server", description=summary)
     p.add_argument("--data-dir", required=True, help="directory for state.db + nbd-server.conf")
-    p.add_argument("--port", type=int, default=4040, help="HTTP control plane port")
+    p.add_argument("--port", type=int, default=8082, help="HTTP control plane port")
     p.add_argument("--nbd-port", type=int, default=10809, help="NBD listening port")
     p.add_argument("--bind", default="0.0.0.0", help="bind address (HTTP + NBD)")
     p.add_argument("--nbd-server-bin", default="nbd-server", help="nbd-server binary to spawn")
