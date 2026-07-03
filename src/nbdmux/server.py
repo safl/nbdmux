@@ -892,6 +892,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_post_export()
         elif parsed.path == "/ui/login":
             self.handle_login_submit()
+        elif parsed.path == "/ui/logout":
+            self.handle_logout()
         else:
             self.send_text(404, "not found\n")
 
@@ -1015,6 +1017,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # navy -> dark-magenta -> magenta gradient (cool -> hot); nbdmux
     # is the magenta terminus (the visible runtime that clients
     # actually connect to over the NBD wire).
+    # Palette: nbdmux is the magenta terminus of the trio's
+    # navy -> dark-magenta -> magenta gradient (bty navy, withcache
+    # dark-magenta, nbdmux magenta). Only ``--bs-primary`` differs
+    # between the three services -- the page chrome (accent strip,
+    # sticky header, dark navbar, brand pill, user-bar) is shared
+    # verbatim so operators moving between the three consoles only
+    # learn one UI grammar.
     _PRIMARY_HEX = "#d63384"  # magenta -- Bootstrap --bs-pink
     _PRIMARY_HOVER = "#c02576"
     _PRIMARY_RGB = "214, 51, 132"
@@ -1031,39 +1040,206 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <link rel="stylesheet" href="/static/bootstrap-icons.min.css">
 <script src="/static/htmx.min.js"></script>
 <style>
-  /* Bootstrap 5 exposes --bs-primary + a matching -rgb triplet
-     used for translucent variants (alerts, focus rings, .bg-*-
-     subtle). Overriding both here re-tints every stock component
-     without patching bootstrap.min.css. */
+  /* Palette overrides (Bootstrap 5). --bs-primary + the -rgb
+     triplet feed every translucent variant (alerts, focus rings,
+     .bg-*-subtle) so re-tinting the whole stock component set is
+     just this block -- no bootstrap.min.css patching needed. */
   :root {{
     --bs-primary: {primary};
     --bs-primary-rgb: {rgb};
     --bs-link-color: {primary};
     --bs-link-hover-color: {hover};
   }}
-  .btn-primary {{ --bs-btn-bg: {primary}; --bs-btn-border-color: {primary};
-                 --bs-btn-hover-bg: {hover}; --bs-btn-hover-border-color: {hover};
-                 --bs-btn-active-bg: {hover}; --bs-btn-active-border-color: {hover}; }}
+  .btn-primary {{
+    --bs-btn-bg: {primary}; --bs-btn-border-color: {primary};
+    --bs-btn-hover-bg: {hover}; --bs-btn-hover-border-color: {hover};
+    --bs-btn-active-bg: {hover}; --bs-btn-active-border-color: {hover};
+  }}
   .bg-primary {{ --bs-bg-opacity: 1; background-color: {primary} !important; }}
   .text-primary {{ --bs-text-opacity: 1; color: {primary} !important; }}
   .border-primary {{ --bs-border-opacity: 1; border-color: {primary} !important; }}
-  /* Brand strip: navy -> dark-magenta -> magenta gradient shared
-     across bty (navy), withcache (dark-magenta) and nbdmux
-     (magenta) so the trio reads as one product family from any
-     of the three consoles. */
-  .brand-accent {{ height: 3px;
-    background: linear-gradient(90deg, #0d3585 0%, #8f1b71 50%, #d63384 100%); }}
+
+  /* Brand accent strip: 3px navy -> dark-magenta -> magenta
+     gradient shared by all three services so the trio reads as
+     one product family from any console. */
+  .brand-accent {{
+    height: 3px;
+    background: linear-gradient(90deg, #0d3585 0%, #8f1b71 50%, #d63384 100%);
+  }}
+  /* Accent + navbar pin to the top together so the brand pill +
+     logout stay reachable while scrolling. */
+  .sticky-header {{ position: sticky; top: 0; z-index: 1030; }}
+  html {{ scroll-padding-top: 5rem; scroll-behavior: smooth; }}
+
+  /* Brand pill. Same padding + radius on every visit; the active
+     state only swaps background colour so the layout doesn't
+     shift as the operator navigates. */
+  .navbar-brand {{
+    border-radius: 0.5rem;
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
+    margin-right: 0.25rem;
+    transition: background-color 0.15s;
+  }}
+  .navbar-brand.brand-active {{ background-color: rgba({rgb}, 0.85); }}
+  .navbar-brand:hover {{ background-color: rgba(255, 255, 255, 0.06); }}
+  .navbar-brand.brand-active:hover {{ background-color: rgba({rgb}, 0.95); }}
+  .navbar-brand .brand-icon {{
+    font-size: 1.05rem;
+    vertical-align: -0.1rem;
+  }}
+  /* Version sits alongside the brand pill but outside it, so the
+     click target stays clean and the version reads as adjacent
+     metadata. */
+  .navbar-version {{
+    color: rgba(255, 255, 255, 0.55);
+    font-weight: 400;
+    font-size: 0.85rem;
+    align-self: center;
+    white-space: nowrap;
+  }}
+  /* nav-btn cascade for the (currently empty) middle-of-navbar
+     link zone; kept ready so a future Settings / Docs pill can
+     drop in without a style diff. */
+  .navbar .nav-btn {{
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.8rem;
+    margin-right: 0.25rem;
+    border-radius: 0.5rem;
+    color: rgba(255, 255, 255, 0.85);
+    text-decoration: none;
+    transition: background-color 0.15s;
+  }}
+  .navbar .nav-btn:hover {{
+    background-color: rgba(255, 255, 255, 0.10);
+    color: #fff;
+  }}
+  .navbar .nav-btn.active {{
+    background-color: {primary};
+    color: #fff;
+    box-shadow: 0 0 0 1px rgba({rgb}, 0.6);
+  }}
+  .navbar .nav-btn i {{ font-size: 1.05rem; }}
+
+  /* User-bar: a single pill containing operator identity + logout,
+     divided by a thin vertical rule. Visually one widget, but two
+     click targets and zero JavaScript. */
+  .user-bar {{
+    display: inline-flex;
+    align-items: stretch;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    overflow: hidden;
+    font-size: 0.85rem;
+  }}
+  .user-bar-name {{
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.8rem;
+    color: rgba(255, 255, 255, 0.92);
+  }}
+  .user-bar-name code {{
+    color: #fff;
+    background: transparent;
+    padding: 0;
+  }}
+  .user-bar-divider {{
+    width: 1px;
+    background-color: rgba(255, 255, 255, 0.18);
+  }}
+  .user-bar-action {{
+    display: inline-flex;
+    align-items: center;
+    padding: 0.35rem 0.7rem;
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.85);
+    text-decoration: none;
+    transition: background-color 0.15s, color 0.15s;
+  }}
+  .user-bar-action:hover,
+  .user-bar-action:focus {{
+    background-color: rgba(255, 255, 255, 0.10);
+    color: #fff;
+    outline: none;
+  }}
+  .user-bar-action.active {{
+    background-color: rgba(255, 255, 255, 0.16);
+    color: #fff;
+  }}
+  /* Logout hover keeps the danger-red signal so it's not
+     confusable with the account/gear action. */
+  .user-bar-logout:hover,
+  .user-bar-logout:focus {{
+    background-color: rgba(220, 53, 69, 0.65);
+    color: #fff;
+  }}
+
+  /* nbdmux-specific status colouring for the exports table. */
   code {{ color: inherit; }}
   .file, .url {{ word-break: break-all; }}
   .status-ready {{ color: var(--bs-success); font-weight: 600; }}
   .status-queued, .status-fetching, .status-decompressing {{
-      color: var(--bs-primary); font-weight: 600; }}
+    color: var(--bs-primary); font-weight: 600;
+  }}
   .status-failed {{ color: var(--bs-danger); font-weight: 600; }}
   .status-idle {{ color: var(--bs-secondary); font-weight: 600; }}
   .status-stopped {{ color: var(--bs-danger); font-weight: 600; }}
   .progress.warm {{ height: .5rem; width: 8rem; margin: .25rem 0 .15rem; }}
 </style>
 </head>"""
+
+    def _user_bar_html(self) -> str:
+        """Right-side operator identity + logout pill. Only rendered
+        when auth is enabled AND the request is authed; on the login
+        page and on unauth-disabled deploys the space stays empty."""
+        if not self.auth.enabled or not self.is_authed():
+            return ""
+        # nbdmux runs its operator UI under a single admin identity;
+        # the container image drops privileges to the ``nbdmux``
+        # user which is what the operator sees inside the pill.
+        return (
+            '<div class="user-bar mt-2 mt-md-0" title="Operator identity">'
+            '<span class="user-bar-name" title="Signed in as">'
+            '<i class="bi bi-person-circle"></i>'
+            "<code>admin</code>"
+            "</span>"
+            '<span class="user-bar-divider"></span>'
+            '<form action="/ui/logout" method="post" class="m-0 d-inline-flex">'
+            '<button type="submit" class="user-bar-action user-bar-logout" '
+            'title="Sign out">'
+            '<i class="bi bi-box-arrow-right"></i>'
+            "</button>"
+            "</form>"
+            "</div>"
+        )
+
+    def _chrome_open(self, *, brand_active: bool) -> str:
+        """Open <body> + the shared accent + dark-navbar + brand pill
+        + user-bar chrome. Caller emits the ``<main>`` content and
+        the closing tags. Kept as one helper so login + dashboard
+        render an identical header without drift."""
+        active_class = " brand-active" if brand_active else ""
+        return f"""<body class="bg-light">
+<div class="sticky-header">
+<div class="brand-accent"></div>
+<nav class="navbar navbar-expand-md bg-dark navbar-dark py-2">
+  <div class="container">
+    <a class="navbar-brand fw-semibold{active_class}" href="/">
+      <i class="bi bi-hdd-network brand-icon me-1"></i>NBDMUX
+    </a>
+    <div class="d-flex flex-grow-1 align-items-center flex-wrap">
+      <div class="me-auto d-flex flex-wrap"></div>
+      <span class="navbar-version me-2">v{html.escape(__version__)}</span>
+      {self._user_bar_html()}
+    </div>
+  </div>
+</nav>
+</div>"""
 
     def render_dash(self) -> str:
         exports = self.store.list_exports()
@@ -1096,17 +1272,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "<em>unset</em> (src_url warms disabled)</span>"
         )
         return f"""{self._head("nbdmux")}
-<body>
-<div class="brand-accent"></div>
-<nav class="navbar navbar-expand navbar-light bg-light border-bottom">
-  <div class="container">
-    <a class="navbar-brand fw-bold text-primary" href="/">
-      <i class="bi bi-hdd-network"></i> nbdmux
-      <span class="badge bg-primary bg-opacity-10 text-primary ms-1">
-        v{html.escape(__version__)}</span>
-    </a>
-  </div>
-</nav>
+{self._chrome_open(brand_active=True)}
 <main class="container py-4">
   <div class="card mb-4">
     <div class="card-header d-flex align-items-center justify-content-between">
@@ -1178,21 +1344,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_html(
             200 if not error else 401,
             f"""{self._head("nbdmux - login")}
-<body>
-<div class="brand-accent"></div>
+{self._chrome_open(brand_active=False)}
 <main class="container py-5">
   <div class="card mx-auto" style="max-width: 24rem;">
     <div class="card-body">
-      <h3 class="card-title fw-bold text-primary">
-        <i class="bi bi-hdd-network"></i> nbdmux
-        <small class="text-muted fs-6">v{html.escape(__version__)}</small>
-      </h3>
-      <p class="text-muted small mb-3">Operator login</p>
+      <h4 class="card-title fw-semibold mb-1">Operator login</h4>
+      <p class="text-muted small mb-3">Sign in to the nbdmux control plane.</p>
       {err}
       <form method="post" action="/ui/login">
         <div class="mb-3">
           <label class="form-label" for="pw">Admin password</label>
-          <input class="form-control" id="pw" type="password" name="password" autofocus required>
+          <input class="form-control" id="pw" type="password" name="password"
+                 autofocus required>
         </div>
         <button class="btn btn-primary w-100" type="submit">Log in</button>
       </form>
@@ -1200,6 +1363,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
   </div>
 </main></body></html>""",
         )
+
+    def handle_logout(self):
+        """Blow away the session cookie and redirect to the login
+        form. Mirrors bty-web's ``/ui/logout`` shape so the trio's
+        auth semantics stay identical from the operator's side."""
+        expired = f"{Auth.COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+        target = "/ui/login" if self.auth.enabled else "/"
+        self.redirect(target, set_cookie=expired)
 
     def handle_login_submit(self):
         form = self.read_form()
