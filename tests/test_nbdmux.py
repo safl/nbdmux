@@ -318,6 +318,48 @@ class TestHttpExports(unittest.TestCase):
         self.assertEqual(urllib.request.urlopen(self.base + "/healthz").read(), b"ok\n")
 
 
+class TestDashboardErrBanner(unittest.TestCase):
+    """render_dash surfaces ``?err=<kind>`` (the redirect target for
+    handle_create_export_form validation failures) as a visible
+    alert banner. Without it, submitting a bad form silently
+    navigates back to / and the operator gets no signal."""
+
+    def setUp(self):
+        self.httpd, _, _ = _start_nbdmux()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def _get(self, path: str) -> str:
+        return urllib.request.urlopen(self.base + path).read().decode("utf-8")
+
+    def test_err_name_renders_name_message(self):
+        body = self._get("/?err=name")
+        self.assertIn("alert-danger", body)
+        self.assertIn("Name is required", body)
+
+    def test_err_src_url_renders_src_url_message(self):
+        body = self._get("/?err=src_url")
+        self.assertIn("alert-danger", body)
+        self.assertIn("Source URL is required", body)
+
+    def test_err_withcache_unset_renders_withcache_message(self):
+        body = self._get("/?err=withcache_unset")
+        self.assertIn("alert-danger", body)
+        self.assertIn("NBDMUX_WITHCACHE_URL", body)
+
+    def test_no_err_renders_no_banner(self):
+        body = self._get("/")
+        self.assertNotIn("alert-danger", body)
+
+    def test_unknown_err_kind_still_shows_generic_banner(self):
+        body = self._get("/?err=mysterious")
+        self.assertIn("alert-danger", body)
+        self.assertIn("mysterious", body)
+
+
 # --------------------------------------------------------------------------
 # Auth-gated control endpoints
 # --------------------------------------------------------------------------
