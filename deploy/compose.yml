@@ -3,7 +3,7 @@
 # Usage:
 #   cp envvars.example envvars && "${EDITOR:-vi}" envvars   # set NBDMUX_ADMIN_PASSWORD
 #   podman compose --env-file envvars up -d
-#   #   http://<host>:4040/   (operator UI)
+#   #   http://<host>:8082/   (operator UI)
 #   #   tcp://<host>:10809    (NBD)
 
 services:
@@ -13,7 +13,7 @@ services:
     environment:
       NBDMUX_ADMIN_PASSWORD: "${NBDMUX_ADMIN_PASSWORD:-}"
     ports:
-      - "${HOST_HTTP_PORT:-4040}:4040"
+      - "${HOST_HTTP_PORT:-8082}:8082"
       - "${HOST_NBD_PORT:-10809}:10809"
     volumes:
       # Persistent: state.db + nbd-server.conf survive restarts here.

@@ -56,13 +56,13 @@ Run the daemon (development; the container deploy is the recommended
 production path):
 
 ```sh
-nbdmux-server --data-dir ./data --port 4040 --nbd-port 10809
+nbdmux-server --data-dir ./data --port 8082 --nbd-port 10809
 ```
 
 Register an image:
 
 ```sh
-curl -X POST http://localhost:4040/exports \
+curl -X POST http://localhost:8082/exports \
      -H 'Content-Type: application/json' \
      -d '{"name": "debian-sysdev", "file": "/path/to/debian-sysdev.img", "readonly": true}'
 ```
