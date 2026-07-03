@@ -909,8 +909,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "auth required"})
                 return
             name = urllib.parse.unquote(parsed.path[len("/exports/") :])
+            # Read the row before dropping it so we can unlink the
+            # warm-created file below. Warm-created exports (src_url
+            # is set) live at a nbdmux-owned path under images_dir;
+            # pre-warmed exports (JSON POST with a ``file`` field)
+            # were placed on disk by the operator and MUST NOT be
+            # unlinked here.
+            row = self.store.get_export(name)
             existed = self.store.delete_export(name)
             self.nbd.reload(self.store.list_ready_exports())
+            if existed and row and row.get("src_url"):
+                path = row.get("file") or ""
+                if path:
+                    with contextlib.suppress(FileNotFoundError, OSError):
+                        os.unlink(path)
             self.send_response(204 if existed else 404)
             self.send_header("Content-Length", "0")
             self.end_headers()

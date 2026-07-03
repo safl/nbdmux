@@ -317,6 +317,76 @@ class TestHttpExports(unittest.TestCase):
     def test_healthz(self):
         self.assertEqual(urllib.request.urlopen(self.base + "/healthz").read(), b"ok\n")
 
+    def test_delete_prewarmed_does_not_unlink_operator_file(self):
+        """Pre-warmed exports (POST /exports {name, file}) point at a
+        file the operator placed on disk. Deleting the export must
+        drop the DB row but NEVER unlink the operator's file."""
+        body = json.dumps({"name": "op", "file": self.img, "readonly": True}).encode()
+        req = urllib.request.Request(
+            self.base + "/exports", data=body, headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req).read()
+        req = urllib.request.Request(self.base + "/exports/op", method="DELETE")
+        with urllib.request.urlopen(req) as r:
+            self.assertEqual(r.status, 204)
+        self.assertTrue(os.path.exists(self.img), "operator's file was unlinked; must not be")
+
+
+class TestDeleteUnlinksWarmCreated(unittest.TestCase):
+    """Warm-created exports (row has ``src_url``) live at a
+    nbdmux-owned path under ``images_dir``. DELETE /exports/<name>
+    must both drop the row AND unlink the file, otherwise a
+    create-then-delete cycle leaks disk space forever."""
+
+    def setUp(self):
+        self.httpd, self.store, _ = _start_nbdmux()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.images_dir = self.httpd.images_dir  # type: ignore[attr-defined]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_delete_warm_created_unlinks_img_file(self):
+        # Simulate a completed warm: row with src_url + a file on disk
+        # at the nbdmux-allocated path.
+        dest = os.path.join(self.images_dir, "warm.img")
+        with open(dest, "wb") as f:
+            f.write(b"warmed bytes")
+        self.store.upsert_export(
+            "warm",
+            dest,
+            readonly=True,
+            status="ready",
+            src_url="https://example/foo.img.zst",
+            format="img.zst",
+        )
+        self.assertTrue(os.path.exists(dest))
+        req = urllib.request.Request(self.base + "/exports/warm", method="DELETE")
+        with urllib.request.urlopen(req) as r:
+            self.assertEqual(r.status, 204)
+        self.assertFalse(
+            os.path.exists(dest),
+            "warm-created .img was not unlinked; DELETE leaks disk space",
+        )
+
+    def test_delete_warm_created_row_gone_even_if_file_missing(self):
+        # If the file is already gone (external cleanup), DELETE
+        # still succeeds and drops the row; the unlink is
+        # best-effort.
+        dest = os.path.join(self.images_dir, "ghost.img")
+        self.store.upsert_export(
+            "ghost",
+            dest,
+            readonly=True,
+            status="failed",
+            src_url="https://example/ghost.img.zst",
+            format="img.zst",
+        )
+        req = urllib.request.Request(self.base + "/exports/ghost", method="DELETE")
+        with urllib.request.urlopen(req) as r:
+            self.assertEqual(r.status, 204)
+
 
 class TestDashboardErrBanner(unittest.TestCase):
     """render_dash surfaces ``?err=<kind>`` (the redirect target for
