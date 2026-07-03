@@ -894,6 +894,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_login_submit()
         elif parsed.path == "/ui/logout":
             self.handle_logout()
+        elif parsed.path == "/admin/create_export":
+            if not self.is_authed():
+                self.redirect("/ui/login")
+                return
+            self.handle_create_export_form()
         else:
             self.send_text(404, "not found\n")
 
@@ -1218,12 +1223,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "</div>"
         )
 
-    def _chrome_open(self, *, brand_active: bool) -> str:
+    def _chrome_open(self, *, brand_active: bool, subnav_html: str = "") -> str:
         """Open <body> + the shared accent + dark-navbar + brand pill
-        + user-bar chrome. Caller emits the ``<main>`` content and
-        the closing tags. Kept as one helper so login + dashboard
+        + user-bar chrome. Optional ``subnav_html`` renders inside a
+        ``.subnav-strip`` immediately below the top navbar, visually
+        attached to the sticky header (matches bty's page-level action
+        strip). Caller emits the ``<main>`` content and the closing
+        tags. Kept as one helper so login + dashboard
         render an identical header without drift."""
         active_class = " brand-active" if brand_active else ""
+        subnav = (
+            f'<div class="subnav-strip"><div class="container">{subnav_html}</div></div>'
+            if subnav_html
+            else ""
+        )
         return f"""<body class="bg-light">
 <div class="sticky-header">
 <div class="brand-accent"></div>
@@ -1239,6 +1252,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     </div>
   </div>
 </nav>
+{subnav}
 </div>"""
 
     def render_dash(self) -> str:
@@ -1271,8 +1285,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else '<span class="text-muted">upstream withcache: '
             "<em>unset</em> (src_url warms disabled)</span>"
         )
+        # Subnav strip: single "Exports" pill on the left (single view
+        # today) + a compact "New export" form on the right (bty's
+        # subnav-actions convention). The form is name + src_url; the
+        # advanced pre-warmed-file path stays available via the JSON
+        # POST /exports API for power users.
+        withcache_configured = bool(withcache)
+        create_disabled = "" if withcache_configured else " disabled"
+        placeholder = (
+            "https://catalog/image.img.zst"
+            if withcache_configured
+            else "NBDMUX_WITHCACHE_URL unset -- see docs"
+        )
+        subnav_html = f"""<ul class="nav nav-pills subnav-jumps m-0">
+  <li class="nav-item"><a class="nav-link active" href="#exports">Exports</a></li>
+</ul>
+<div class="subnav-actions ms-auto d-flex align-items-center">
+  <form hx-post="/admin/create_export" hx-target="body" hx-swap="outerHTML"
+        hx-indicator="#spin" class="m-0 d-flex align-items-center gap-1">
+    <label for="new-name" class="text-muted small mb-0">name</label>
+    <input class="form-control form-control-sm" id="new-name" name="name"
+           style="width: 10rem;" placeholder="debian-13" required{create_disabled}>
+    <label for="new-src" class="text-muted small mb-0 ms-2">src_url</label>
+    <input class="form-control form-control-sm" id="new-src" name="src_url"
+           style="width: 20rem;" placeholder="{placeholder}" required{create_disabled}>
+    <button class="btn btn-sm btn-primary ms-1" type="submit"{create_disabled}
+            >Add</button>
+  </form>
+  <progress id="spin" class="htmx-indicator ms-2" style="width:5rem;height:.4rem;"></progress>
+</div>"""
         return f"""{self._head("nbdmux")}
-{self._chrome_open(brand_active=True)}
+{self._chrome_open(brand_active=True, subnav_html=subnav_html)}
 <main class="container py-4">
   <div class="card mb-4">
     <div class="card-header d-flex align-items-center justify-content-between">
@@ -1363,6 +1406,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
   </div>
 </main></body></html>""",
         )
+
+    def handle_create_export_form(self):
+        """UI create-export: reads form-encoded ``{name, src_url}``,
+        forwards through the same validation the JSON POST ``/exports``
+        uses, then 303-redirects back to ``/`` so the browser flips
+        into GET and the dashboard shows the new queued row. Errors
+        redirect back with the reason in a ?err= query so the shell
+        page can (in a future pass) surface them; for MVP the row
+        will show ``failed`` with the message on the next render."""
+        form = self.read_form()
+        name = form.get("name", "").strip()
+        src_url = form.get("src_url", "").strip()
+        if not name or "/" in name or name.startswith(".") or len(name) > 64:
+            self.redirect("/?err=name")
+            return
+        if not src_url:
+            self.redirect("/?err=src_url")
+            return
+        if (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() == "":
+            self.redirect("/?err=withcache_unset")
+            return
+        # Mirror handle_post_export's warm-path logic.
+        format_hint = _detect_format(src_url, None)
+        dest = os.path.join(self.images_dir, f"{name}.img")
+        self.store.upsert_export(
+            name,
+            dest,
+            readonly=True,
+            status="queued",
+            src_url=src_url,
+            format=format_hint,
+        )
+        self.warmer.enqueue(name)
+        self.redirect("/")
 
     def handle_logout(self):
         """Blow away the session cookie and redirect to the login
