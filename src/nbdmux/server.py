@@ -54,7 +54,14 @@ def now_iso() -> str:
 
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-MIME_TYPES = {".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
+MIME_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+}
 
 
 # --------------------------------------------------------------------------
@@ -850,16 +857,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_text(404, "not found\n")
 
     def serve_static(self, parsed):
-        """Serve files under ``src/nbdmux/static/`` (pico.min.css +
-        htmx.min.js). basename() blocks any ``..`` path traversal."""
-        name = os.path.basename(parsed.path)
-        path = os.path.join(STATIC_DIR, name)
-        if not name or not os.path.isfile(path):
+        """Serve files under ``src/nbdmux/static/`` (Bootstrap CSS +
+        Bootstrap Icons CSS + htmx.min.js + the icon font files under
+        ``static/fonts/`` that bootstrap-icons.min.css references via
+        a relative ``fonts/…`` src). Constrain to ``static/`` and
+        ``static/fonts/`` explicitly; abspath+startswith rejects any
+        ``..`` traversal past the static root."""
+        rel = parsed.path[len("/static/") :]
+        if not rel or rel.endswith("/"):
             self.send_text(404, "not found\n")
             return
-        with open(path, "rb") as f:
+        target = os.path.abspath(os.path.join(STATIC_DIR, rel))
+        static_root = os.path.abspath(STATIC_DIR) + os.sep
+        if not target.startswith(static_root) or not os.path.isfile(target):
+            self.send_text(404, "not found\n")
+            return
+        with open(target, "rb") as f:
             data = f.read()
-        ext = os.path.splitext(name)[1]
+        ext = os.path.splitext(target)[1]
         self.send_response(200)
         self.send_header("Content-Type", MIME_TYPES.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
@@ -992,48 +1007,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(200, record)
 
     # -- operator UI -------------------------------------------------------
-    # Pico's default primary is a rich blue (#0172ad). nbdmux mirrors
-    # the same saturation/lightness at a hue shifted to purple so it
-    # reads as the intentional cousin of withcache's palette, not a
-    # random accent. Overriding --pico-primary in both themes covers
-    # buttons, focus rings, active tabs, links, and the progress bar.
-    _PALETTE = """\
-  :root {
-    --pico-primary: #6b1fa2;
-    --pico-primary-hover: #7d33b5;
-    --pico-primary-focus: rgba(107, 31, 162, .25);
-  }
-  [data-theme="dark"] {
-    --pico-primary: #b076e0;
-    --pico-primary-hover: #c090ea;
-    --pico-primary-focus: rgba(176, 118, 224, .3);
-  }
-"""
+    # bty ships a Bootstrap 5 stack (bootstrap.min.css +
+    # bootstrap-icons.min.css + htmx). All three ecosystem services
+    # (bty, nbdmux, withcache) share that stack so operators only
+    # learn one UI grammar; the primary hue is what tells them
+    # which service they're on. The trio sits on a
+    # navy -> dark-magenta -> magenta gradient (cool -> hot); nbdmux
+    # is the magenta terminus (the visible runtime that clients
+    # actually connect to over the NBD wire).
+    _PRIMARY_HEX = "#d63384"  # magenta -- Bootstrap --bs-pink
+    _PRIMARY_HOVER = "#c02576"
+    _PRIMARY_RGB = "214, 51, 132"
 
     def _head(self, title: str) -> str:
+        primary = self._PRIMARY_HEX
+        hover = self._PRIMARY_HOVER
+        rgb = self._PRIMARY_RGB
         return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<link rel="stylesheet" href="/static/pico.min.css">
+<link rel="stylesheet" href="/static/bootstrap.min.css">
+<link rel="stylesheet" href="/static/bootstrap-icons.min.css">
 <script src="/static/htmx.min.js"></script>
 <style>
-{self._PALETTE}
-  main.container {{ max-width: 1100px; padding-top: 1rem; }}
-  h4 {{ margin-bottom: .4rem; }}
-  table {{ font-size: .9rem; margin-bottom: 0; }}
-  .url, .file {{ word-break: break-all; }}
-  .mono {{ font-family: var(--pico-font-family-monospace); font-size: .85em; }}
-  code {{ font-size: .85em; }}
-  .status-ready {{ color: #2e7d32; font-weight: 600; }}
+  /* Bootstrap 5 exposes --bs-primary + a matching -rgb triplet
+     used for translucent variants (alerts, focus rings, .bg-*-
+     subtle). Overriding both here re-tints every stock component
+     without patching bootstrap.min.css. */
+  :root {{
+    --bs-primary: {primary};
+    --bs-primary-rgb: {rgb};
+    --bs-link-color: {primary};
+    --bs-link-hover-color: {hover};
+  }}
+  .btn-primary {{ --bs-btn-bg: {primary}; --bs-btn-border-color: {primary};
+                 --bs-btn-hover-bg: {hover}; --bs-btn-hover-border-color: {hover};
+                 --bs-btn-active-bg: {hover}; --bs-btn-active-border-color: {hover}; }}
+  .bg-primary {{ --bs-bg-opacity: 1; background-color: {primary} !important; }}
+  .text-primary {{ --bs-text-opacity: 1; color: {primary} !important; }}
+  .border-primary {{ --bs-border-opacity: 1; border-color: {primary} !important; }}
+  /* Brand strip: navy -> dark-magenta -> magenta gradient shared
+     across bty (navy), withcache (dark-magenta) and nbdmux
+     (magenta) so the trio reads as one product family from any
+     of the three consoles. */
+  .brand-accent {{ height: 3px;
+    background: linear-gradient(90deg, #0d3585 0%, #8f1b71 50%, #d63384 100%); }}
+  code {{ color: inherit; }}
+  .file, .url {{ word-break: break-all; }}
+  .status-ready {{ color: var(--bs-success); font-weight: 600; }}
   .status-queued, .status-fetching, .status-decompressing {{
-      color: var(--pico-primary); font-weight: 600; }}
-  .status-failed {{ color: var(--pico-del-color, #c0392b); font-weight: 600; }}
-  progress.warm {{ width: 8rem; height: .5rem; margin: .25rem 0 .15rem; }}
-  .err {{ background: var(--pico-del-color, #c0392b); color: #fff;
-          padding: .7rem 1rem; border-radius: var(--pico-border-radius); margin-bottom: 1rem; }}
-  .stopped {{ color: var(--pico-del-color, #c0392b); font-weight: 600; }}
-  .idle {{ color: var(--pico-muted-color); font-weight: 600; }}
+      color: var(--bs-primary); font-weight: 600; }}
+  .status-failed {{ color: var(--bs-danger); font-weight: 600; }}
+  .status-idle {{ color: var(--bs-secondary); font-weight: 600; }}
+  .status-stopped {{ color: var(--bs-danger); font-weight: 600; }}
+  .progress.warm {{ height: .5rem; width: 8rem; margin: .25rem 0 .15rem; }}
 </style>
 </head>"""
 
@@ -1043,58 +1071,74 @@ class Handler(http.server.BaseHTTPRequestHandler):
         nbd_endpoint = f"tcp://{host}:{self.nbd_port}"
         withcache = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip()
         rows = "".join(self._render_export_row(e) for e in exports) or (
-            '<tr><td colspan="5"><em>No exports registered yet.</em></td></tr>'
+            '<tr><td colspan="5" class="text-center text-muted">'
+            "<em>No exports registered yet.</em></td></tr>"
         )
-        # Distinguish "process is intentionally down because there's
-        # nothing to serve yet" from "process was up and crashed".
-        # Zero ready exports + zero registered rows = deferred by
-        # design (nbd-server refuses to launch with an empty INI); paint
-        # it as neutral "idle" so operators don't triage a non-issue.
         ready = [e for e in exports if (e.get("status") or "ready") == "ready"]
         if self.nbd.is_running():
-            running = "running"
+            status_line = (
+                '<span class="status-ready"><i class="bi bi-play-circle-fill"></i> running</span>'
+            )
         elif not ready:
-            running = (
-                '<span class="idle">idle</span>'
-                " <small><em>(starts on first ready export)</em></small>"
+            status_line = (
+                '<span class="status-idle"><i class="bi bi-pause-circle"></i> idle</span>'
+                ' <small class="text-muted">(starts on first ready export)</small>'
             )
         else:
-            running = '<span class="stopped">STOPPED</span>'
+            status_line = (
+                '<span class="status-stopped">'
+                '<i class="bi bi-exclamation-octagon-fill"></i> STOPPED</span>'
+            )
         upstream = (
             f"upstream withcache: <code>{html.escape(withcache)}</code>"
             if withcache
-            else "upstream withcache: <em>unset</em> (src_url warms disabled)"
-        )
-        logout = (
-            '<li><form method="post" action="/ui/logout" style="margin:0">'
-            '<button type="submit" class="secondary outline" '
-            'style="width:auto;padding:.3rem .8rem">Log out</button></form></li>'
-            if self.auth.enabled and hasattr(self, "handle_logout")
-            else ""
+            else '<span class="text-muted">upstream withcache: '
+            "<em>unset</em> (src_url warms disabled)</span>"
         )
         return f"""{self._head("nbdmux")}
-<body><main class="container">
-  <nav>
-    <ul><li>
-      <strong>nbdmux</strong>
-      &nbsp;<small class="mono">v{html.escape(__version__)}</small>
-    </li></ul>
-    <ul>{logout}</ul>
-  </nav>
-  <p><small>nbd-server: {running} &middot; endpoint:
-  <code>{html.escape(nbd_endpoint)}</code> &middot; {len(exports)} export(s)
-  &middot; {upstream}</small></p>
-  <table><thead><tr>
-    <th>Name</th><th>File</th><th>Mode</th>
-    <th>Status</th><th>Added</th></tr></thead>
-  <tbody>{rows}</tbody></table>
-  <hr>
-  <p><small>HTTP control:
-  <code>POST /exports {{name, file}}</code> (pre-warmed) or
-  <code>POST /exports {{name, src_url}}</code> (warm via withcache) /
-  <code>DELETE /exports/&lt;name&gt;</code> /
-  <code>GET /exports</code>. See README for the wire format.</small></p>
-</main></body></html>"""
+<body>
+<div class="brand-accent"></div>
+<nav class="navbar navbar-expand navbar-light bg-light border-bottom">
+  <div class="container">
+    <a class="navbar-brand fw-bold text-primary" href="/">
+      <i class="bi bi-hdd-network"></i> nbdmux
+      <span class="badge bg-primary bg-opacity-10 text-primary ms-1">
+        v{html.escape(__version__)}</span>
+    </a>
+  </div>
+</nav>
+<main class="container py-4">
+  <div class="card mb-4">
+    <div class="card-header d-flex align-items-center justify-content-between">
+      <span><i class="bi bi-broadcast text-primary"></i> nbd-server</span>
+      <small class="text-muted">{len(exports)} export(s)</small>
+    </div>
+    <div class="card-body">
+      <p class="mb-2">{status_line}</p>
+      <p class="mb-1"><small>endpoint <code>{html.escape(nbd_endpoint)}</code></small></p>
+      <p class="mb-0"><small>{upstream}</small></p>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><i class="bi bi-collection text-primary"></i> Exports</div>
+    <div class="table-responsive">
+    <table class="table table-sm table-striped table-hover align-middle mb-0">
+      <thead class="table-light">
+        <tr><th>Name</th><th>File</th><th>Mode</th><th>Status</th><th>Added</th></tr>
+      </thead>
+      <tbody>{rows}</tbody>
+    </table>
+    </div>
+    <div class="card-footer bg-white">
+      <small class="text-muted">HTTP control:
+      <code>POST /exports {{name, file}}</code> (pre-warmed) or
+      <code>POST /exports {{name, src_url}}</code> (warm via withcache) /
+      <code>DELETE /exports/&lt;name&gt;</code> /
+      <code>GET /exports</code>. See README for the wire format.</small>
+    </div>
+  </div>
+</main>
+</body></html>"""
 
     def _render_export_row(self, e: dict[str, Any]) -> str:
         """One <tr> for an export. Renders progress bar + status pill
@@ -1130,22 +1174,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.auth.enabled:
             self.redirect("/")
             return
-        err = f'<div class="err">{html.escape(error)}</div>' if error else ""
+        err = f'<div class="alert alert-danger">{html.escape(error)}</div>' if error else ""
         self.send_html(
             200 if not error else 401,
             f"""{self._head("nbdmux - login")}
-<body><main class="container">
-  <article style="max-width: 24rem; margin: 4rem auto;">
-    <hgroup>
-      <h2>nbdmux <small class="mono">v{html.escape(__version__)}</small></h2>
-      <p>operator login</p>
-    </hgroup>
-    {err}
-    <form method="post" action="/ui/login">
-      <input type="password" name="password" placeholder="Admin password" autofocus required>
-      <button type="submit">Log in</button>
-    </form>
-  </article>
+<body>
+<div class="brand-accent"></div>
+<main class="container py-5">
+  <div class="card mx-auto" style="max-width: 24rem;">
+    <div class="card-body">
+      <h3 class="card-title fw-bold text-primary">
+        <i class="bi bi-hdd-network"></i> nbdmux
+        <small class="text-muted fs-6">v{html.escape(__version__)}</small>
+      </h3>
+      <p class="text-muted small mb-3">Operator login</p>
+      {err}
+      <form method="post" action="/ui/login">
+        <div class="mb-3">
+          <label class="form-label" for="pw">Admin password</label>
+          <input class="form-control" id="pw" type="password" name="password" autofocus required>
+        </div>
+        <button class="btn btn-primary w-100" type="submit">Log in</button>
+      </form>
+    </div>
+  </div>
 </main></body></html>""",
         )
 
