@@ -4,10 +4,12 @@ No third-party deps; src/ is put on the path so the package imports
 without an install.
 """
 
+import gzip
 import http.client
 import http.server
 import json
 import os
+import shutil
 import socketserver
 import sys
 import tempfile
@@ -626,6 +628,260 @@ class TestClientLibrary(unittest.TestCase):
 
     def test_is_healthy_false_on_unreachable(self):
         self.assertFalse(client.is_healthy("http://127.0.0.1:1", timeout=0.5))
+
+    def test_warm_export_wire_shape_reaches_handler(self):
+        """warm_export POSTs ``{name, src_url, readonly}`` to /exports.
+        With NBDMUX_WITHCACHE_URL unset on the daemon the server
+        returns 400 with the ``withcache`` reason -- the fact we get
+        that specific error back proves the wire payload was
+        well-formed and the src_url branch of POST /exports fired."""
+        saved = os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        try:
+            with self.assertRaises(client.NbdmuxError) as cm:
+                client.warm_export(
+                    "warmme",
+                    "https://example/foo.img.zst",
+                    server=self.base,
+                )
+            self.assertIn("withcache", str(cm.exception).lower())
+        finally:
+            if saved is not None:
+                os.environ["NBDMUX_WITHCACHE_URL"] = saved
+
+    def test_warm_export_forwards_format_override(self):
+        """When ``format`` is explicit, it lands in the row so the
+        warmer picks the matching decompressor even if the src_url's
+        extension doesn't tell the story."""
+        os.environ["NBDMUX_WITHCACHE_URL"] = "http://withcache.test:8081"
+        try:
+            record = client.warm_export(
+                "gz-explicit",
+                "https://example/foo.blob",  # no .gz extension
+                format="img.gz",
+                server=self.base,
+            )
+            self.assertEqual(record["format"], "img.gz")
+            self.assertEqual(record["src_url"], "https://example/foo.blob")
+            self.assertEqual(record["status"], "queued")
+        finally:
+            os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+
+
+# --------------------------------------------------------------------------
+# Warm pipeline: _detect_format, _decompressor_cmd, _resolve_withcache_url,
+# and Warmer._process end-to-end against a local origin.
+# --------------------------------------------------------------------------
+class TestDetectFormat(unittest.TestCase):
+    def test_override_wins(self):
+        self.assertEqual(server._detect_format("x.zst", "img.gz"), "img.gz")
+
+    def test_gz_extension(self):
+        self.assertEqual(server._detect_format("http://h/x.img.gz", None), "img.gz")
+        self.assertEqual(server._detect_format("http://h/x.gz", None), "img.gz")
+
+    def test_zst_extension(self):
+        self.assertEqual(server._detect_format("http://h/x.img.zst", None), "img.zst")
+        self.assertEqual(server._detect_format("http://h/x.zst", None), "img.zst")
+
+    def test_xz_extension(self):
+        self.assertEqual(server._detect_format("http://h/x.img.xz", None), "img.xz")
+        self.assertEqual(server._detect_format("http://h/x.xz", None), "img.xz")
+
+    def test_default_is_raw_img(self):
+        self.assertEqual(server._detect_format("http://h/x.blob", None), "img")
+
+    def test_none_src_url(self):
+        self.assertEqual(server._detect_format(None, None), "img")
+
+
+class TestDecompressorCmd(unittest.TestCase):
+    def test_gz_maps_to_gunzip(self):
+        self.assertEqual(server._decompressor_cmd("img.gz"), ["gunzip", "-c"])
+        self.assertEqual(server._decompressor_cmd("gz"), ["gunzip", "-c"])
+
+    def test_zst_maps_to_zstd(self):
+        self.assertEqual(server._decompressor_cmd("img.zst"), ["zstd", "-d", "-c"])
+
+    def test_xz_maps_to_xz(self):
+        self.assertEqual(server._decompressor_cmd("img.xz"), ["xz", "-d", "-c"])
+
+    def test_unknown_format_raises(self):
+        with self.assertRaises(ValueError):
+            server._decompressor_cmd("img")
+
+
+class TestResolveWithcacheUrl(unittest.TestCase):
+    def setUp(self):
+        self._saved = os.environ.get("NBDMUX_WITHCACHE_URL")
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        else:
+            os.environ["NBDMUX_WITHCACHE_URL"] = self._saved
+
+    def test_wraps_src_url_in_b64_path_segment(self):
+        os.environ["NBDMUX_WITHCACHE_URL"] = "http://withcache:8081"
+        got = server._resolve_withcache_url("https://origin/x.img.gz")
+        self.assertTrue(got.startswith("http://withcache:8081/b/"))
+        # The tail is a base64url-encoded canonical src URL.
+        encoded = got.rsplit("/", 1)[-1]
+        import base64
+
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        self.assertEqual(decoded, b"https://origin/x.img.gz")
+
+    def test_strips_trailing_slash_from_base(self):
+        os.environ["NBDMUX_WITHCACHE_URL"] = "http://withcache:8081/"
+        got = server._resolve_withcache_url("https://origin/x")
+        self.assertNotIn("//b/", got.replace("http://", ""))
+
+    def test_unset_raises(self):
+        os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        with self.assertRaises(ValueError):
+            server._resolve_withcache_url("https://origin/x")
+
+
+class _WarmOrigin(http.server.BaseHTTPRequestHandler):
+    """Serves the fixed payload at any path. The warm request goes
+    through ``/b/<b64(src)>`` so the actual path is the encoded src
+    URL; decode the tail to decide whether to serve raw or gzipped
+    bytes so a single origin exercises both decompression branches."""
+
+    PAYLOAD_RAW = b"NBDMUX-WARM-TEST-" * 64  # 1088 bytes; non-trivial
+    PAYLOAD_GZ = gzip.compress(PAYLOAD_RAW)
+
+    def do_GET(self):
+        # Decode the b64 tail of the /b/<encoded> path. If the
+        # encoded src URL contains ``.raw`` we serve raw bytes,
+        # otherwise gzipped. Falls back to gzipped for non-/b/
+        # paths (defensive).
+        tail = self.path.rsplit("/", 1)[-1]
+        try:
+            import base64
+
+            decoded = base64.urlsafe_b64decode(tail + "=" * (-len(tail) % 4)).decode(
+                "utf-8", "replace"
+            )
+        except (ValueError, UnicodeDecodeError):
+            decoded = ""
+        if ".raw" in decoded:
+            body = self.PAYLOAD_RAW
+        else:
+            body = self.PAYLOAD_GZ
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class TestWarmerProcess(unittest.TestCase):
+    """Warmer._process is nbdmux's core pipeline; it selects a
+    decompressor, streams through the withcache-wrapped URL, atomically
+    lands the raw .img, and transitions the row queued -> fetching ->
+    decompressing -> ready. Failures leave a ``failed`` row + no
+    lingering .inflight file."""
+
+    def setUp(self):
+        self.origin = socketserver.TCPServer(("127.0.0.1", 0), _WarmOrigin)
+        threading.Thread(target=self.origin.serve_forever, daemon=True).start()
+        self.origin_port = self.origin.server_address[1]
+        self.tmpdir = tempfile.mkdtemp()
+        self.images_dir = os.path.join(self.tmpdir, "images")
+        os.makedirs(self.images_dir, exist_ok=True)
+        self.store = server.Store(self.tmpdir)
+        self.nbd = _FakeNbdServer()
+        self.warmer = server.Warmer(store=self.store, nbd=self.nbd, images_dir=self.images_dir)
+        self._saved = os.environ.get("NBDMUX_WITHCACHE_URL")
+        # Point the warmer at the local origin; the ``/b/<b64>``
+        # rewriting sits above the transport and the local origin
+        # serves any path.
+        os.environ["NBDMUX_WITHCACHE_URL"] = f"http://127.0.0.1:{self.origin_port}"
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        else:
+            os.environ["NBDMUX_WITHCACHE_URL"] = self._saved
+        self.origin.shutdown()
+        self.origin.server_close()
+
+    def _seed_row(self, name: str, src_url: str, fmt: str) -> str:
+        dest = os.path.join(self.images_dir, f"{name}.img")
+        self.store.upsert_export(
+            name, dest, readonly=True, status="queued", src_url=src_url, format=fmt
+        )
+        return dest
+
+    def test_row_missing_returns_without_touching_state(self):
+        self.warmer._process("does-not-exist")
+        self.assertEqual(self.store.list_exports(), [])
+        self.assertEqual(self.nbd.reload_calls, [])
+
+    def test_non_queued_row_is_skipped(self):
+        self._seed_row("skipme", "https://origin/foo.img.gz", "img.gz")
+        self.store.set_status("skipme", "ready", set_completed=True)
+        self.warmer._process("skipme")
+        # Still "ready", not touched -> nbd_server never re-reloaded.
+        self.assertEqual(self.store.get_export("skipme")["status"], "ready")
+        self.assertEqual(self.nbd.reload_calls, [])
+
+    def test_no_src_url_row_is_failed(self):
+        # Seed a row and then null the src_url in-place.
+        self._seed_row("orphan", "https://origin/x", "img")
+        with self.store.conn() as c:
+            c.execute("UPDATE exports SET src_url=NULL WHERE name='orphan'")
+        self.warmer._process("orphan")
+        row = self.store.get_export("orphan")
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("src_url", row["error"])
+
+    def test_withcache_env_unset_lands_row_in_failed(self):
+        os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        self._seed_row("nowarm", "https://origin/foo.img.gz", "img.gz")
+        self.warmer._process("nowarm")
+        row = self.store.get_export("nowarm")
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("NBDMUX_WITHCACHE_URL", row["error"])
+
+    def test_happy_path_raw_img_writes_dest_and_marks_ready(self):
+        # format=img -> no decompressor, straight copy of bytes.
+        # ``.raw`` in the src_url makes the origin serve raw bytes.
+        dest = self._seed_row("raw", "https://origin/x.raw.img", "img")
+        self.warmer._process("raw")
+        row = self.store.get_export("raw")
+        self.assertEqual(row["status"], "ready")
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), _WarmOrigin.PAYLOAD_RAW)
+        # nbd-server was re-reloaded with the new ready row.
+        self.assertEqual(len(self.nbd.reload_calls), 1)
+        self.assertEqual(self.nbd.reload_calls[0][0]["name"], "raw")
+        # No .inflight left behind.
+        self.assertFalse(os.path.exists(dest + ".inflight"))
+
+    @unittest.skipUnless(shutil.which("gunzip"), "gunzip not installed")
+    def test_happy_path_gz_decompresses_and_marks_ready(self):
+        dest = self._seed_row("warm", "https://origin/x.img.gz", "img.gz")
+        self.warmer._process("warm")
+        row = self.store.get_export("warm")
+        self.assertEqual(row["status"], "ready", f"error={row.get('error')!r}")
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), _WarmOrigin.PAYLOAD_RAW)
+        self.assertFalse(os.path.exists(dest + ".inflight"))
+
+    def test_fetch_failure_lands_row_in_failed_and_cleans_inflight(self):
+        # Point at a port nothing is listening on so urlopen fails.
+        os.environ["NBDMUX_WITHCACHE_URL"] = "http://127.0.0.1:1"
+        dest = self._seed_row("bust", "https://origin/x.img.gz", "img.gz")
+        self.warmer._process("bust")
+        row = self.store.get_export("bust")
+        self.assertEqual(row["status"], "failed")
+        self.assertFalse(os.path.exists(dest + ".inflight"))
+        self.assertFalse(os.path.exists(dest))
 
 
 if __name__ == "__main__":
