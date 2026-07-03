@@ -41,7 +41,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Any, ClassVar
+from typing import Any
 
 from . import __version__
 
@@ -804,11 +804,6 @@ class NbdServer:
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = f"nbdmux/{__version__}"
     protocol_version = "HTTP/1.1"
-
-    JSON_ROUTES: ClassVar[set[str]] = {
-        "/exports",
-        "/healthz",
-    }
 
     @property
     def store(self) -> Store:
