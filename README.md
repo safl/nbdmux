@@ -59,12 +59,26 @@ production path):
 nbdmux-server --data-dir ./data --port 8082 --nbd-port 10809
 ```
 
-Register an image:
+Register an image. Two body shapes are accepted:
+
+**Pre-warmed** -- point at a file the operator has already placed
+on disk:
 
 ```sh
 curl -X POST http://localhost:8082/exports \
      -H 'Content-Type: application/json' \
      -d '{"name": "debian-sysdev", "file": "/path/to/debian-sysdev.img", "readonly": true}'
+```
+
+**Warm via withcache** -- nbdmux fetches ``src_url`` through the
+configured withcache, decompresses on the fly (gzip / zstd / xz),
+and lands the raw .img under ``<images-dir>/<name>.img``. Requires
+``NBDMUX_WITHCACHE_URL`` set on the daemon:
+
+```sh
+curl -X POST http://localhost:8082/exports \
+     -H 'Content-Type: application/json' \
+     -d '{"name": "debian-sysdev", "src_url": "https://catalog/debian-sysdev.img.zst", "readonly": true}'
 ```
 
 Then on a target Linux box:
