@@ -16,13 +16,14 @@ dependency is ``nbd-server`` (Debian / Ubuntu: ``apt install
 nbd-server``; Fedora: ``dnf install nbd``).
 """
 
-from .client import add_export, list_exports, remove_export, warm_export
+from .client import add_export, is_healthy, list_exports, remove_export, warm_export
 
 __version__ = "0.2.10"
 
 __all__ = [
     "__version__",
     "add_export",
+    "is_healthy",
     "list_exports",
     "remove_export",
     "warm_export",
