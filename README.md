@@ -122,6 +122,12 @@ Single-tenant, server-signed cookie -- same pattern as withcache. Set
 `NBDMUX_ADMIN_PASSWORD` to gate the operator UI + the HTTP control
 plane; unset = open with a startup warning.
 
+`NBDMUX_SESSION_SECRET` pins the HMAC key that signs session cookies.
+Unset (or blank) = the daemon generates a fresh 64-hex key at first
+start and persists it under `<data-dir>/session-secret`. Set it
+explicitly to keep cookies valid across a container rebuild that
+wipes the data volume, or to rotate the secret on demand.
+
 The NBD port itself is unauthenticated (nbd-server's classical model);
 LAN-only assumption, firewall is the operator's responsibility.
 
