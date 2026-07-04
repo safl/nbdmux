@@ -191,6 +191,91 @@ class TestNbdServerConfig(unittest.TestCase):
         self.assertFalse(os.path.exists(self.nbd.config_path + ".tmp"))
 
 
+def _write_fake_nbd_bin(tmpdir: str) -> str:
+    """Write a tiny shell script that ignores its args and blocks
+    forever (via ``exec sleep``). Lets NbdServer.start /
+    reload / stop exercise real subprocess supervision without
+    needing nbd-server on the runner."""
+    path = os.path.join(tmpdir, "fake-nbd-server")
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\nexec sleep 60\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+@unittest.skipUnless(os.path.exists("/bin/sh"), "sh not available")
+class TestNbdServerLifecycle(unittest.TestCase):
+    """Exercise NbdServer's supervision surface end-to-end against a
+    fake nbd-server binary that blocks on ``sleep``. The audit noted
+    the deferred-start path (empty exports -> no subprocess) + the
+    empty-reload path (config drops to zero exports -> stop the
+    daemon) had zero coverage."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.fake_bin = _write_fake_nbd_bin(self.tmpdir)
+        self.nbd = server.NbdServer(
+            data_dir=self.tmpdir,
+            port=10809,
+            bind="0.0.0.0",
+            nbd_server_bin=self.fake_bin,
+        )
+
+    def tearDown(self):
+        self.nbd.stop()
+
+    def _one_export(self):
+        return [{"name": "demo", "file": "/tmp/demo.img", "readonly": True}]
+
+    def test_start_with_empty_exports_is_deferred(self):
+        # No exports -> config gets written, but no subprocess is
+        # spawned (nbd-server would hard-fail with 'No configured
+        # exports; quitting').
+        self.nbd.start([])
+        self.assertFalse(self.nbd.is_running())
+        self.assertTrue(os.path.exists(self.nbd.config_path))
+
+    def test_start_with_one_export_spawns_subprocess(self):
+        self.nbd.start(self._one_export())
+        self.assertTrue(self.nbd.is_running())
+
+    def test_reload_from_empty_starts_deferred_daemon(self):
+        # start([]) deferred it; first non-empty reload() lifts off.
+        self.nbd.start([])
+        self.assertFalse(self.nbd.is_running())
+        self.nbd.reload(self._one_export())
+        self.assertTrue(self.nbd.is_running())
+
+    def test_reload_to_empty_stops_running_daemon(self):
+        # An empty reload() with a currently-running daemon must stop
+        # it cleanly; SIGHUP-ing an empty-INI would kill it messily.
+        self.nbd.start(self._one_export())
+        self.assertTrue(self.nbd.is_running())
+        self.nbd.reload([])
+        self.assertFalse(self.nbd.is_running())
+
+    def test_reload_while_empty_and_stopped_is_no_op(self):
+        # Neither the daemon nor the config had exports; a subsequent
+        # empty reload() should just rewrite the (still-empty) config
+        # and stay dormant, not crash.
+        self.nbd.start([])
+        self.nbd.reload([])
+        self.assertFalse(self.nbd.is_running())
+
+    def test_start_is_idempotent(self):
+        self.nbd.start(self._one_export())
+        pid_before = self.nbd._proc.pid  # type: ignore[union-attr]
+        self.nbd.start(self._one_export())
+        pid_after = self.nbd._proc.pid  # type: ignore[union-attr]
+        self.assertEqual(pid_before, pid_after)
+
+    def test_stop_transitions_running_to_not_running(self):
+        self.nbd.start(self._one_export())
+        self.assertTrue(self.nbd.is_running())
+        self.nbd.stop()
+        self.assertFalse(self.nbd.is_running())
+
+
 # --------------------------------------------------------------------------
 # HTTP control plane (live server, no nbd-server subprocess)
 # --------------------------------------------------------------------------
