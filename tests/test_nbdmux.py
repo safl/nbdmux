@@ -702,6 +702,48 @@ class TestCreateExportForm(unittest.TestCase):
         self.assertEqual(status, 303)
         self.assertEqual(location, "/?err=name")
 
+    def test_ini_metachars_in_name_redirects_with_err(self):
+        """Characters that could corrupt the ``[<name>]`` INI section
+        header nbd-server parses must be rejected -- otherwise an
+        authenticated operator could inject a rogue export section
+        via ``name=x]\\n[rogue\\nexportname=...``. Covers ``]``,
+        ``[``, ``#``, ``;``, ``=``, ``\\n``, plus a leading dot."""
+        for bad in ("x]y", "x[y", "x#y", "x;y", "x=y", "x\ny", ".hidden"):
+            with self.subTest(name=bad):
+                status, location = _post_form(
+                    self.host,
+                    self.port,
+                    "/admin/create_export",
+                    {"name": bad, "src_url": "https://example/x.img"},
+                )
+                self.assertEqual(status, 303)
+                self.assertEqual(location, "/?err=name")
+        # A valid alnum-leading name still lands (control).
+        status, location = _post_form(
+            self.host,
+            self.port,
+            "/admin/create_export",
+            {"name": "demo-1.2_3", "src_url": "https://example/x.img"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/")
+
+    def test_ini_metachars_rejected_on_json_post_exports(self):
+        """Same validation must fire on POST /exports so the JSON API
+        can't sidestep it."""
+        import urllib.request
+
+        body = json.dumps({"name": "x]y", "src_url": "https://example/x.img.zst"}).encode()
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}/exports",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req)
+        self.assertEqual(cm.exception.code, 400)
+        self.assertIn(b"nbd-server.conf", cm.exception.read())
+
     def test_missing_src_url_redirects_with_err(self):
         status, location = _post_form(
             self.host,

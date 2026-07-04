@@ -31,6 +31,7 @@ import http.cookies
 import http.server
 import json
 import os
+import re
 import secrets
 import signal
 import socketserver
@@ -44,6 +45,22 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import __version__
+
+# The export name goes into two places that both parse it structurally:
+#   * ``[<name>]`` section header in ``nbd-server.conf``, which
+#     nbd-server reads as INI. Any ``]``, ``[``, ``\n``, ``#``,
+#     ``;``, or ``=`` in the name corrupts the section OR silently
+#     injects a new one.
+#   * ``<images-dir>/<name>.img`` when warm-created; ``/`` escapes
+#     the images dir and ``.`` prefix makes it dotfile-hidden.
+# Constrain to alnum-leading + alnum/dot/dash/underscore, max 64
+# chars, matching bty's label validator (bty/web/_models.py):
+_EXPORT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _valid_export_name(name: str) -> bool:
+    return bool(_EXPORT_NAME_RE.match(name))
+
 
 USER_AGENT = f"nbdmux/{__version__}"
 _DB_WRITE_LOCK = threading.Lock()
@@ -974,8 +991,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not isinstance(name, str) or not name.strip():
             self.send_json(400, {"error": "name: non-empty string required"})
             return
-        if "/" in name or name.startswith(".") or len(name) > 64:
-            self.send_json(400, {"error": "name: must be a short identifier with no slashes"})
+        if not _valid_export_name(name):
+            self.send_json(
+                400,
+                {
+                    "error": (
+                        "name: alnum-leading, alnum/./-/_ only, max 64 chars "
+                        "(constrained so it can't corrupt nbd-server.conf sections)"
+                    )
+                },
+            )
             return
         if (path is None) == (src_url is None):
             self.send_json(
@@ -1466,7 +1491,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         name = form.get("name", "").strip()
         src_url = form.get("src_url", "").strip()
-        if not name or "/" in name or name.startswith(".") or len(name) > 64:
+        if not name or not _valid_export_name(name):
             self.redirect("/?err=name")
             return
         if not src_url:
