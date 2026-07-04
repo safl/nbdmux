@@ -4,6 +4,19 @@
 # startup warning; only safe on a LAN-internal nbdmux).
 NBDMUX_ADMIN_PASSWORD=
 
+# Upstream withcache URL. Required for the warm-via-src_url path
+# (``POST /exports {name, src_url}`` and the New Export subnav form).
+# When unset, nbdmux logs a startup warning and rejects src_url-based
+# warm requests -- only the pre-warmed ``{name, file}`` variant works.
+# The typical bty deploy points this at the sibling withcache container.
+NBDMUX_WITHCACHE_URL=
+
+# Optional: signed-cookie HMAC key. Empty (or absent) = auto-generate
+# a fresh 64-hex key at first start and persist it under /data. Set
+# explicitly to keep cookies valid across a container rebuild that
+# wipes the data volume, or to rotate the secret on demand.
+#NBDMUX_SESSION_SECRET=
+
 # Optional: host ports to publish. Default: same as the in-container
 # defaults (8082 HTTP, 10809 NBD). 8082 fits the shared 8080-series
 # scheme (bty 8080, withcache 8081, nbdmux 8082).

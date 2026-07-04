@@ -12,6 +12,12 @@ services:
     restart: unless-stopped
     environment:
       NBDMUX_ADMIN_PASSWORD: "${NBDMUX_ADMIN_PASSWORD:-}"
+      # Threaded through so the warm-via-src_url path works; unset
+      # here means nbdmux logs a startup warning and rejects src_url
+      # POSTs. Point at the sibling withcache in the bty integration.
+      NBDMUX_WITHCACHE_URL: "${NBDMUX_WITHCACHE_URL:-}"
+      # Optional signed-cookie HMAC key; unset = auto-generate + persist.
+      NBDMUX_SESSION_SECRET: "${NBDMUX_SESSION_SECRET:-}"
     ports:
       - "${HOST_HTTP_PORT:-8082}:8082"
       - "${HOST_NBD_PORT:-10809}:10809"
