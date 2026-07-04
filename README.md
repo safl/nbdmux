@@ -97,7 +97,7 @@ fdisk -l /dev/nbd0   # the .img's partition table
 | POST   | `/exports`               | `{name, file, readonly?: bool}` (pre-warmed) OR `{name, src_url}` (warm via withcache) | the new export |
 | DELETE | `/exports/{name}`        | -                                             | 204 (warm-created also unlinks the .img) |
 | POST   | `/admin/create_export`   | form-encoded `name=...&src_url=...`           | 303 to `/` (dashboard) |
-| GET    | `/healthz`               | -                                             | `ok`           |
+| GET    | `/healthz`               | -                                             | `ok` (200) when nbd-server is up, `nbd-server not running` (503) when down |
 | GET    | `/`                      | -                                             | operator dashboard |
 
 `POST /admin/create_export` is what the operator UI's New Export
@@ -116,15 +116,11 @@ withcache, only the primary hue differs (magenta -- the terminus of
 the trio's navy -> dark-magenta -> magenta gradient) so operators
 tell the three consoles apart at a glance.
 
-Login is a signed session cookie gated on `NBDMUX_ADMIN_PASSWORD`
-(same pattern as withcache). With no password set, the UI is open
-and the daemon logs a startup warning.
-
 ## Auth
 
 Single-tenant, server-signed cookie -- same pattern as withcache. Set
 `NBDMUX_ADMIN_PASSWORD` to gate the operator UI + the HTTP control
-plane. Unset = open with a startup warning.
+plane; unset = open with a startup warning.
 
 The NBD port itself is unauthenticated (nbd-server's classical model);
 LAN-only assumption, firewall is the operator's responsibility.
