@@ -1493,6 +1493,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.redirect(target, set_cookie=expired)
 
     def handle_login_submit(self):
+        """Verify the posted password. On match, set the session
+        cookie and 303 to /; on mismatch, re-render the login form
+        with a generic error. Both branches log the attempt (before
+        the response, so the line lands even if the client drops
+        the connection mid-write) so operators can grep ``podman
+        logs`` for who authenticated when."""
         try:
             form = self.read_form()
         except ValueError:
@@ -1503,6 +1509,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         pw = form.get("password", "")
         if self.auth.check_password(pw):
+            print(f"{self.address_string()} - login succeeded", flush=True)
             cookie = (
                 f"{Auth.COOKIE}={self.auth.make_token()}; HttpOnly; SameSite=Lax; "
                 f"Path=/; Max-Age={Auth.MAX_AGE}"
