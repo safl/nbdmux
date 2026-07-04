@@ -108,12 +108,13 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Publish the artifact the ``wheels`` job produced -- not a
+      # fresh rebuild -- so what lands on PyPI is bit-identical to
+      # what the release assets link to. Matches withcache's shape.
+      - uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
-      - run: pip install build
-      - run: make wheel
+          name: dist
+          path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
