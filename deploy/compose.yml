@@ -23,10 +23,13 @@ services:
       - "${HOST_NBD_PORT:-10809}:10809"
     volumes:
       # Persistent: state.db + nbd-server.conf survive restarts here.
+      # Also holds warm-created .img files at /data/images/<name>.img
+      # (the ``warm via src_url`` path landing under <data-dir>/images).
       - nbdmux-data:/data
-      # Read-only bind of the host directory holding the .img files
-      # nbdmux will serve as NBD exports. Operator places files here
-      # (or, in the bty integration, bty-web decompresses into here).
+      # Read-only bind of the host directory holding pre-warmed .img
+      # files the operator has placed on disk out-of-band; registered
+      # via POST /exports {name, file}. Warm-created files land
+      # inside the nbdmux-data volume above, NOT here.
       - "${IMAGES_HOST_DIR:-./images}:/images:ro"
 
 volumes:
