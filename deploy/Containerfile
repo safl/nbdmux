@@ -15,10 +15,17 @@ RUN apt-get update \
         python3 \
         python3-pip \
         ca-certificates \
+        curl \
         gzip \
         zstd \
         xz-utils \
  && rm -rf /var/lib/apt/lists/*
+
+# curl: HEALTHCHECK below. curl's ``-f`` treats any 4xx/5xx as a
+# non-zero exit without dumping a Python Traceback into
+# ``podman logs`` on every probe when /healthz returns 503
+# (nbd-server down). The Python-in-CMD alternative worked but
+# spammed the logs on every failed probe.
 
 # gzip / zstd / xz-utils: the Warmer pipeline (v0.2.0+) pipes
 # upstream bytes through ``gunzip -c`` / ``zstd -d -c`` / ``xz -d -c``
@@ -44,8 +51,7 @@ VOLUME ["/images"]
 EXPOSE 8082 10809
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s \
-    CMD python3 -c "import urllib.request, sys; \
-        sys.exit(0 if urllib.request.urlopen('http://localhost:8082/healthz', timeout=2).status == 200 else 1)"
+    CMD curl -fsS -o /dev/null --max-time 2 http://localhost:8082/healthz || exit 1
 
 ENTRYPOINT ["nbdmux-server"]
 CMD ["--data-dir", "/data", "--port", "8082", "--nbd-port", "10809"]
