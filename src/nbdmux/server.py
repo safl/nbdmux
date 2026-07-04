@@ -1270,6 +1270,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "export. Set the env var and restart, or POST /exports with a "
             "pre-warmed {name, file} pair."
         ),
+        "malformed": "Form submission was malformed (duplicate fields?).",
     }
 
     def render_dash(self) -> str:
@@ -1453,7 +1454,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         reason; ``render_dash`` reads the query and renders an
         alert banner above the nbd-server card so the operator
         sees why nothing was created."""
-        form = self.read_form()
+        try:
+            form = self.read_form()
+        except ValueError:
+            self.redirect("/?err=malformed")
+            return
         name = form.get("name", "").strip()
         src_url = form.get("src_url", "").strip()
         if not name or "/" in name or name.startswith(".") or len(name) > 64:
@@ -1488,7 +1493,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.redirect(target, set_cookie=expired)
 
     def handle_login_submit(self):
-        form = self.read_form()
+        try:
+            form = self.read_form()
+        except ValueError:
+            # Malformed submission (duplicate password fields, etc.)
+            # -- fail auth silently like a bad password rather than
+            # surface parser internals.
+            self.handle_login_form(error="Invalid password.")
+            return
         pw = form.get("password", "")
         if self.auth.check_password(pw):
             cookie = (
@@ -1519,9 +1531,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return morsel.value if morsel else None
 
     def read_form(self) -> dict[str, str]:
+        """Parse form-encoded body into ``{key: value}``. Rejects
+        duplicate keys with ValueError -- an operator-facing form
+        never has repeated field names, so ``name=a&name=b`` is
+        either a bug or a client trying to hide a payload from a
+        naive read of the first value. Callers wrap the call and
+        turn a ValueError into a 4xx / redirect."""
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length).decode("utf-8") if length else ""
-        return {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
+        pairs = urllib.parse.parse_qs(body)
+        dups = [k for k, v in pairs.items() if len(v) > 1]
+        if dups:
+            raise ValueError(f"duplicate form field(s): {', '.join(sorted(dups))}")
+        return {k: v[0] for k, v in pairs.items()}
 
     def _read_json(self) -> Any:
         length = int(self.headers.get("Content-Length", 0) or 0)
