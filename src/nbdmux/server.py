@@ -1650,7 +1650,14 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def main() -> int:
     summary = (__doc__ or "nbdmux daemon").splitlines()[0]
     p = argparse.ArgumentParser(prog="nbdmux-server", description=summary)
-    p.add_argument("--data-dir", required=True, help="directory for state.db + nbd-server.conf")
+    # ``--data-dir`` falls back to ``$NBDMUX_DATA_DIR`` so the
+    # container's ENV NBDMUX_DATA_DIR=/data (deploy/Containerfile) is
+    # actually consulted; only when neither is set do we bail.
+    p.add_argument(
+        "--data-dir",
+        default=os.environ.get("NBDMUX_DATA_DIR"),
+        help="directory for state.db + nbd-server.conf (env: NBDMUX_DATA_DIR)",
+    )
     p.add_argument("--port", type=int, default=8082, help="HTTP control plane port")
     p.add_argument("--nbd-port", type=int, default=10809, help="NBD listening port")
     p.add_argument("--bind", default="0.0.0.0", help="bind address (HTTP + NBD)")
@@ -1662,6 +1669,8 @@ def main() -> int:
     )
     args = p.parse_args()
 
+    if not args.data_dir:
+        p.error("--data-dir is required (or set NBDMUX_DATA_DIR)")
     data_dir = os.path.abspath(args.data_dir)
     os.makedirs(data_dir, exist_ok=True)
     images_dir = os.path.abspath(args.images_dir or os.path.join(data_dir, "images"))
