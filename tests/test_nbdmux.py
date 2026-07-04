@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import socketserver
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -1102,6 +1103,232 @@ class TestWarmerProcess(unittest.TestCase):
         self.warmer._process("bust")
         row = self.store.get_export("bust")
         self.assertEqual(row["status"], "failed")
+        self.assertFalse(os.path.exists(dest + ".inflight"))
+        self.assertFalse(os.path.exists(dest))
+
+
+class TestStoreSchemaRotation(unittest.TestCase):
+    """Store._maybe_rotate_on_schema_mismatch preserves an old-schema
+    state.db as ``.v<N>.<ts>.bak`` and lands a fresh schema. Silent
+    data loss on upgrade if this path breaks, so cover all three
+    branches: pre-v0.2.0 (schema_version table absent), current
+    version match (no-op), and other-version rotate."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _db_path(self):
+        return os.path.join(self.tmpdir, "state.db")
+
+    def _write_v1_db(self):
+        """Emulate a pre-v0.2.0 state.db: create an ``exports`` table
+        with the v1 columns and NO ``schema_version`` table."""
+        path = self._db_path()
+        with sqlite3.connect(path) as c:
+            c.execute("CREATE TABLE exports (name TEXT PRIMARY KEY, file TEXT)")
+            c.execute("INSERT INTO exports (name, file) VALUES ('legacy', '/tmp/x.img')")
+
+    def test_missing_db_is_noop(self):
+        # Fresh dir, no state.db -> instantiate Store -> creates fresh.
+        s = server.Store(self.tmpdir)
+        self.assertTrue(os.path.exists(self._db_path()))
+        # No .bak files land because there was nothing to rotate.
+        self.assertEqual([f for f in os.listdir(self.tmpdir) if ".bak" in f], [])
+        self.assertEqual(s.list_exports(), [])
+
+    def test_current_version_is_noop(self):
+        # First Store instance creates schema_version=CURRENT.
+        s1 = server.Store(self.tmpdir)
+        s1.upsert_export("keeper", "/tmp/keep.img")
+        # Second instance sees version-match, does NOT rotate.
+        s2 = server.Store(self.tmpdir)
+        names = [e["name"] for e in s2.list_exports()]
+        self.assertIn("keeper", names)
+        self.assertEqual([f for f in os.listdir(self.tmpdir) if ".bak" in f], [])
+
+    def test_pre_v0_2_0_rotates(self):
+        """schema_version table absent (interpreted as v1) -> rotate."""
+        self._write_v1_db()
+        s = server.Store(self.tmpdir)
+        # The legacy row is gone (fresh DB); the .bak file exists.
+        self.assertEqual(s.list_exports(), [])
+        baks = [f for f in os.listdir(self.tmpdir) if f.endswith(".bak")]
+        self.assertEqual(len(baks), 1, f"expected 1 .bak, got {baks!r}")
+        self.assertIn(".v1.", baks[0])
+
+    def test_other_version_rotates_and_cleans_sidecars(self):
+        """schema_version=99 (some future or corrupt value) -> rotate.
+        Also verify -journal / -wal / -shm sidecars get unlinked."""
+        path = self._db_path()
+        with sqlite3.connect(path) as c:
+            c.execute("CREATE TABLE schema_version (version INTEGER)")
+            c.execute("INSERT INTO schema_version (version) VALUES (99)")
+        # Drop stub sidecar files that the rotation should unlink.
+        for suffix in ("-journal", "-wal", "-shm"):
+            open(path + suffix, "w").close()
+        server.Store(self.tmpdir)
+        baks = [f for f in os.listdir(self.tmpdir) if f.endswith(".bak")]
+        self.assertEqual(len(baks), 1)
+        self.assertIn(".v99.", baks[0])
+        # Sidecars gone.
+        for suffix in ("-journal", "-wal", "-shm"):
+            self.assertFalse(os.path.exists(path + suffix))
+
+
+class TestAuthExpiry(unittest.TestCase):
+    """Auth.valid rejects a token whose ``iat`` claim is older than
+    MAX_AGE. Parity with withcache's TestAuth.test_expired_token_rejected;
+    nbdmux dropped this test."""
+
+    def test_expired_token_rejected(self):
+        a = server.Auth(b"secret-key", "pw")
+        a.MAX_AGE = -1  # every token is instantly stale
+        self.assertFalse(a.valid(a.make_token()))
+
+
+class TestControlBase(unittest.TestCase):
+    """client.control_base normalises the ``server=`` argument the
+    consumer passes to add_export / list_exports / etc. Direct tests
+    since the live-server tests all pass fully-qualified URLs."""
+
+    def test_bare_host_gets_http_prefix(self):
+        self.assertEqual(client.control_base("host"), "http://host")
+
+    def test_host_port_gets_http_prefix(self):
+        self.assertEqual(client.control_base("host:8082"), "http://host:8082")
+
+    def test_full_url_preserved(self):
+        self.assertEqual(client.control_base("http://host:8082"), "http://host:8082")
+
+    def test_trailing_slash_stripped(self):
+        self.assertEqual(client.control_base("http://host:8082/"), "http://host:8082")
+
+    def test_https_preserved(self):
+        self.assertEqual(client.control_base("https://host"), "https://host")
+
+
+class TestWarmerEnqueueDedup(unittest.TestCase):
+    """Warmer.enqueue(name) coalesces duplicate calls into a single
+    queue entry. Matters when handle_create_export_form fires twice
+    because of a browser double-submit; a refactor that dropped the
+    dedup would let Warmer._run double-process the same warm."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = server.Store(self.tmpdir)
+        self.nbd = _FakeNbdServer()
+        # Do NOT call .start(); we only exercise .enqueue().
+        self.warmer = server.Warmer(store=self.store, nbd=self.nbd, images_dir=self.tmpdir)
+
+    def test_dedup_across_multiple_calls(self):
+        self.warmer.enqueue("x")
+        self.warmer.enqueue("x")
+        self.warmer.enqueue("x")
+        self.assertEqual(list(self.warmer._queue), ["x"])
+
+    def test_distinct_names_kept(self):
+        self.warmer.enqueue("a")
+        self.warmer.enqueue("b")
+        self.warmer.enqueue("a")  # dup of first
+        self.assertEqual(list(self.warmer._queue), ["a", "b"])
+
+
+class TestServeStatic(unittest.TestCase):
+    """Handler.serve_static serves the bundled Bootstrap CSS / htmx
+    assets and refuses ``..`` path-traversal. Security-adjacent guard
+    on a public (unauthenticated) endpoint."""
+
+    def setUp(self):
+        self.httpd, _, _ = _start_nbdmux()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_bundled_asset_serves_with_correct_mime(self):
+        r = urllib.request.urlopen(self.base + "/static/bootstrap.min.css")
+        self.assertEqual(r.status, 200)
+        # Some Python releases append ``; charset=utf-8`` to text/css;
+        # assert on the prefix so both shapes accept.
+        self.assertTrue(r.getheader("Content-Type").startswith("text/css"))
+        self.assertGreater(int(r.getheader("Content-Length")), 0)
+
+    def test_empty_static_path_returns_404(self):
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/static/")
+        self.assertEqual(cm.exception.code, 404)
+
+    def test_dotdot_traversal_rejected(self):
+        # abspath resolves and startswith(static_root) rejects.
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/static/../server.py")
+        self.assertEqual(cm.exception.code, 404)
+
+    def test_absent_asset_returns_404(self):
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/static/does-not-exist.css")
+        self.assertEqual(cm.exception.code, 404)
+
+
+class TestWarmerCorruptPayload(unittest.TestCase):
+    """When the decompressor exits rc!=0 (upstream served garbage as
+    the wrong format), _fetch_and_decompress raises RuntimeError and
+    _process should land the row in ``failed`` and clean the
+    .inflight tempfile. TestWarmerProcess covers connection-refused
+    (URL failure BEFORE the decompressor spawns); this covers the
+    more common 'valid HTTP response but corrupt payload' failure."""
+
+    def setUp(self):
+        # Serve raw bytes but tell the warmer to gunzip them.
+        class _RawOrigin(http.server.BaseHTTPRequestHandler):
+            PAYLOAD = b"this is not gzipped bytes" * 100
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(self.PAYLOAD)))
+                self.end_headers()
+                self.wfile.write(self.PAYLOAD)
+
+            def log_message(self, format, *args):
+                pass
+
+        self.origin = socketserver.TCPServer(("127.0.0.1", 0), _RawOrigin)
+        threading.Thread(target=self.origin.serve_forever, daemon=True).start()
+        self.tmpdir = tempfile.mkdtemp()
+        self.images_dir = os.path.join(self.tmpdir, "images")
+        os.makedirs(self.images_dir)
+        self.store = server.Store(self.tmpdir)
+        self.nbd = _FakeNbdServer()
+        self.warmer = server.Warmer(store=self.store, nbd=self.nbd, images_dir=self.images_dir)
+        self._saved = os.environ.get("NBDMUX_WITHCACHE_URL")
+        os.environ["NBDMUX_WITHCACHE_URL"] = f"http://127.0.0.1:{self.origin.server_address[1]}"
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        else:
+            os.environ["NBDMUX_WITHCACHE_URL"] = self._saved
+        self.origin.shutdown()
+        self.origin.server_close()
+
+    @unittest.skipUnless(shutil.which("gunzip"), "gunzip not installed")
+    def test_corrupt_gz_payload_lands_row_in_failed(self):
+        dest = os.path.join(self.images_dir, "corrupt.img")
+        self.store.upsert_export(
+            "corrupt",
+            dest,
+            readonly=True,
+            status="queued",
+            src_url="https://origin/x.img.gz",
+            format="img.gz",
+        )
+        self.warmer._process("corrupt")
+        row = self.store.get_export("corrupt")
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("decompressor", row["error"] or "")
+        # Both the .inflight tempfile and the dest are cleaned up so
+        # a retry starts from scratch.
         self.assertFalse(os.path.exists(dest + ".inflight"))
         self.assertFalse(os.path.exists(dest))
 
