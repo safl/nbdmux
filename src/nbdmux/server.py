@@ -1239,8 +1239,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tags. Kept as one helper so login + dashboard
         render an identical header without drift."""
         active_class = " brand-active" if brand_active else ""
+        # <nav class="navbar subnav-strip"> matches bty's canonical
+        # subnav shape (bty/src/bty/web/_templates/ui/_subnav.html);
+        # ``.navbar`` gets the Bootstrap subnav-strip vertical rhythm,
+        # aria-label + <nav> give screen readers a landmark.
         subnav = (
-            f'<div class="subnav-strip"><div class="container">{subnav_html}</div></div>'
+            f'<nav class="navbar subnav-strip" aria-label="Section sub-navigation">'
+            f'<div class="container">{subnav_html}</div></nav>'
             if subnav_html
             else ""
         )
