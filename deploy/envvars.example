@@ -23,8 +23,11 @@ NBDMUX_WITHCACHE_URL=
 #HOST_HTTP_PORT=8082
 #HOST_NBD_PORT=10809
 
-# Where the .img files live on the host. Bound read-only into the
-# container at /images. nbdmux serves whatever absolute path the
-# operator registers via POST /exports; using a single host directory
-# for the .img files just keeps the bind-mount simple.
+# Where pre-warmed .img files live on the host. Bound read-only
+# into the container at /images. Used by the pre-warmed POST
+# /exports {name, file} path -- the operator drops files here
+# out-of-band and registers them. Warm-created files (POST
+# /exports {name, src_url} + the New Export subnav form) land
+# inside the nbdmux-data volume at /data/images/<name>.img
+# instead and are NOT visible on this host directory.
 #IMAGES_HOST_DIR=./images
