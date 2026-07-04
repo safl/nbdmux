@@ -42,10 +42,17 @@ RUN pip install --break-system-packages --no-cache-dir .
 ENV NBDMUX_DATA_DIR=/data
 VOLUME ["/data"]
 
-# Image files we serve as NBD exports live under /images (a read-only
-# bind from the host that holds the actual .img bytes). This is just
-# the convention; the daemon will serve any absolute path the operator
-# registers.
+# Two distinct paths for .img files:
+#   /images (this VOLUME, typically a host bind mount) -- pre-warmed
+#     images the operator places on disk, registered via
+#     POST /exports {name, file}. The daemon serves them read-only.
+#   /data/images (inside the /data volume above) -- warm-created
+#     images the daemon decompresses under <data-dir>/images/<name>.img
+#     when the warm-via-src_url path fires. NOT visible on the /images
+#     bind; a create-then-delete cycle here unlinks the .img
+#     (DELETE /exports/<name> post-Pass-2).
+# The daemon will serve any absolute path the operator registers; the
+# split above is convention, not enforcement.
 VOLUME ["/images"]
 
 EXPOSE 8082 10809
