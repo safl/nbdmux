@@ -632,7 +632,13 @@ class Warmer:
                         err = proc.stderr.read()
                     rc = proc.wait()
                     if rc != 0:
-                        raise RuntimeError(f"decompressor exited rc={rc}: {err.decode('replace')}")
+                        # ``decode(errors="replace")`` -- ``'replace'`` is the
+                        # error handler, not a codec name; ``err.decode('replace')``
+                        # (the previous form) raises LookupError instead of
+                        # surfacing the decompressor's stderr.
+                        raise RuntimeError(
+                            f"decompressor exited rc={rc}: {err.decode('utf-8', errors='replace')}"
+                        )
                 else:
                     writer.close()
         # The decompressed-size = the size on disk (after the
