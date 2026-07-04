@@ -883,8 +883,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(data)
+        self.wfile.write(data)
 
     def do_POST(self):
         parsed = urllib.parse.urlsplit(self.path)
@@ -1379,6 +1378,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
       <small class="text-muted">HTTP control:
       <code>POST /exports {{name, file}}</code> (pre-warmed) or
       <code>POST /exports {{name, src_url}}</code> (warm via withcache) /
+      <code>POST /admin/create_export</code> (form-encoded, subnav) /
       <code>DELETE /exports/&lt;name&gt;</code> /
       <code>GET /exports</code>. See README for the wire format.</small>
     </div>
