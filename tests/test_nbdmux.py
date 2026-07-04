@@ -837,7 +837,7 @@ class TestClientLibrary(unittest.TestCase):
             record = client.warm_export(
                 "gz-explicit",
                 "https://example/foo.blob",  # no .gz extension
-                format="img.gz",
+                format_hint="img.gz",
                 server=self.base,
             )
             self.assertEqual(record["format"], "img.gz")

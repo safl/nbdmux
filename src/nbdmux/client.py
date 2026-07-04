@@ -131,7 +131,7 @@ def warm_export(
     name: str,
     src_url: str,
     *,
-    format: str | None = None,
+    format_hint: str | None = None,
     readonly: bool = True,
     server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
@@ -142,16 +142,18 @@ def warm_export(
     ``status='queued'`` record; caller polls :func:`list_exports`
     (or watches the dashboard) for progress / ready.
 
-    ``format`` overrides the decompressor selector if the URL's
+    ``format_hint`` overrides the decompressor selector if the URL's
     extension doesn't tell the story (``img`` / ``img.gz`` /
     ``img.zst`` / ``img.xz``). Default: auto-derive from the URL.
+    Named ``format_hint`` (not ``format``) to avoid shadowing the
+    builtin and to match the server-side slot in ``_detect_format``.
 
     Raises :class:`NbdmuxError` if ``NBDMUX_WITHCACHE_URL`` isn't
     configured on the daemon, or on any HTTP failure.
     """
     body: dict[str, Any] = {"name": name, "src_url": src_url, "readonly": readonly}
-    if format is not None:
-        body["format"] = format
+    if format_hint is not None:
+        body["format"] = format_hint
     return _request("POST", server, "/exports", body=body, timeout=timeout)
 
 
