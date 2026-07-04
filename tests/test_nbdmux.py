@@ -588,7 +588,7 @@ class TestDashboardErrBanner(unittest.TestCase):
 # --------------------------------------------------------------------------
 class TestAuthGate(unittest.TestCase):
     def setUp(self):
-        self.httpd, _, _ = _start_nbdmux(password="letmein")
+        self.httpd, _, self.nbd = _start_nbdmux(password="letmein")
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
     def tearDown(self):
@@ -611,6 +611,12 @@ class TestAuthGate(unittest.TestCase):
         urllib.request.urlopen(self.base + "/exports").read()  # 200, no auth header
 
     def test_healthz_is_open(self):
+        """The auth gate does not apply to /healthz. Assert that we get
+        past the gate (no 401) rather than the specific 200/503 -- the
+        supervision-status split is exercised in TestHttpExports."""
+        # Pin the fixture state so the test doesn't rot when
+        # _FakeNbdServer's default flips.
+        self.nbd.running = True
         urllib.request.urlopen(self.base + "/healthz").read()  # 200, no auth header
 
 
@@ -716,6 +722,29 @@ class TestCreateExportForm(unittest.TestCase):
         )
         self.assertEqual(status, 303)
         self.assertEqual(location, "/?err=withcache_unset")
+
+    def test_duplicate_form_field_redirects_with_err_malformed(self):
+        """read_form rejects duplicate keys so a client can't hide a
+        payload behind a first-value-wins collapse. The redirect goes
+        to /?err=malformed and no row is created."""
+        # Craft a raw body with duplicate ``name`` fields; urlencode
+        # + a dict argument would collapse them client-side.
+        conn = http.client.HTTPConnection(self.host, self.port)
+        try:
+            body = "name=evil&name=demo&src_url=https%3A%2F%2Fexample%2Fx.img.zst"
+            conn.request(
+                "POST",
+                "/admin/create_export",
+                body=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 303)
+            self.assertEqual(resp.getheader("Location"), "/?err=malformed")
+            resp.read()
+        finally:
+            conn.close()
+        self.assertEqual(self.store.list_exports(), [])
 
 
 class TestCreateExportFormAuthGate(unittest.TestCase):
