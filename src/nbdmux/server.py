@@ -836,7 +836,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/healthz":
-            self.send_text(200, "ok\n")
+            # HEALTHCHECK for the container -- gate on the nbd-server
+            # subprocess actually being up so orchestration reacts to
+            # a mid-life crash. Returning 200 while the daemon is down
+            # would keep the container marked healthy while NBD
+            # clients get connection refused on 10809.
+            if self.nbd.is_running():
+                self.send_text(200, "ok\n")
+            else:
+                self.send_text(503, "nbd-server not running\n")
         elif parsed.path == "/exports":
             self.send_json(200, self.store.list_exports())
         elif parsed.path == "/ui/login":

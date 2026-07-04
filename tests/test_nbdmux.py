@@ -316,8 +316,19 @@ class TestHttpExports(unittest.TestCase):
             urllib.request.urlopen(req)
         self.assertEqual(cm.exception.code, 404)
 
-    def test_healthz(self):
+    def test_healthz_ok_when_nbd_running(self):
         self.assertEqual(urllib.request.urlopen(self.base + "/healthz").read(), b"ok\n")
+
+    def test_healthz_503_when_nbd_down(self):
+        """The container HEALTHCHECK hits /healthz to decide whether
+        the container is alive. When nbd-server is down (crash, kill,
+        deferred-start with no exports yet), /healthz must reflect
+        that so orchestration sees the container as unhealthy and
+        fires the restart policy."""
+        self.nbd.running = False
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/healthz")
+        self.assertEqual(cm.exception.code, 503)
 
     def test_delete_prewarmed_does_not_unlink_operator_file(self):
         """Pre-warmed exports (POST /exports {name, file}) point at a
