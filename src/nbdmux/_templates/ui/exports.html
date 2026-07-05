@@ -1,0 +1,121 @@
+{% extends "ui/_layout.html" %}
+{% block title %}Exports - nbdmux{% endblock %}
+
+{% block subnav %}
+<nav class="navbar subnav-strip" aria-label="Section sub-navigation">
+    <div class="container">
+        <span class="d-flex align-items-center flex-wrap">
+            <span class="text-muted">
+                {{ exports|length }} export{{ '' if exports|length == 1 else 's' }} registered
+                {% if withcache_url %}
+                <span class="vr"></span>
+                warms via <code>{{ withcache_url }}</code>
+                {% else %}
+                <span class="vr"></span>
+                <span class="text-warning">no NBDMUX_WITHCACHE_URL configured; warms will 400</span>
+                {% endif %}
+            </span>
+        </span>
+    </div>
+</nav>
+{% endblock %}
+
+{% block intro %}
+{# One-sentence context so an operator landing here knows what
+   nbdmux does without hunting for the README. Same pattern bty
+   uses on /ui/images (intro_box.html). #}
+<div class="alert alert-secondary small mb-3">
+    Each row is an nbd-server export the multiplexer serves over
+    TCP. Pre-warmed exports point at an existing file on disk;
+    warm-via-withcache exports go through a fetch + decompress
+    pipeline before landing at <em>ready</em>. Only <em>ready</em>
+    exports are visible to nbd-server on the wire.
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="card mb-3">
+    <div class="card-header bg-light fw-semibold d-flex flex-wrap align-items-center gap-2 py-2">
+        <span class="text-nowrap"><i class="bi bi-list-ul me-1"></i>Exports</span>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-striped table-hover mb-0 align-middle">
+            <thead class="table-light">
+                <tr>
+                    <th>Name</th>
+                    <th>Status</th>
+                    <th>Progress</th>
+                    <th>File</th>
+                    <th>Source</th>
+                    <th>Format</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for e in exports %}
+                <tr>
+                    <td>
+                        <i class="bi bi-broadcast text-secondary me-1"></i>
+                        <code>{{ e.name }}</code>
+                    </td>
+                    <td>
+                        {# Status pill colours match the wire states
+                           the JSON /exports endpoint documents: green
+                           for ready (nbd-server picks up), red for
+                           failed (operator retries), blue for the
+                           three in-flight intermediates. #}
+                        {% if e.status == 'ready' %}
+                        <span class="badge bg-success">ready</span>
+                        {% elif e.status == 'failed' %}
+                        <span class="badge bg-danger" title="{{ e.error or 'see logs' }}">failed</span>
+                        {% else %}
+                        <span class="badge bg-info text-dark">{{ e.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="min-width: 10rem;">
+                        {% if e.progress is not none %}
+                        <div class="progress" style="height: 0.65rem;" role="progressbar"
+                             aria-valuenow="{{ e.progress }}" aria-valuemin="0" aria-valuemax="100">
+                            <div class="progress-bar bg-primary" style="width: {{ e.progress }}%"></div>
+                        </div>
+                        <small class="text-muted">{{ e.progress }}%</small>
+                        {% elif e.status == 'ready' %}
+                        <small class="text-muted">-</small>
+                        {% else %}
+                        <small class="text-muted">pending</small>
+                        {% endif %}
+                    </td>
+                    <td class="small font-monospace text-truncate" style="max-width: 24rem;"
+                        title="{{ e.file }}">
+                        {{ e.file }}
+                    </td>
+                    <td class="small font-monospace text-truncate" style="max-width: 20rem;"
+                        title="{{ e.src_url or '' }}">
+                        {% if e.src_url %}
+                        {{ e.src_url }}
+                        {% else %}
+                        <span class="text-muted">pre-warmed</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if e.format %}
+                        <span class="badge bg-light text-dark border">{{ e.format }}</span>
+                        {% else %}
+                        <span class="text-muted">-</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not exports %}
+                <tr><td colspan="6" class="text-muted text-center py-3">
+                    No exports registered yet. Operators POST to
+                    <code>/exports</code> to register (see the
+                    <code>nbdmux.client</code> library) or bty-web's
+                    Pre-warm button on <em>Images</em> to warm one
+                    for ramboot.
+                </td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

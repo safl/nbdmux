@@ -164,7 +164,15 @@ def create_app(
         nav_active are context vars every template can rely on.
         """
         ctx.setdefault("version", __version__)
-        ctx.setdefault("logged_in", bool(request.session.get(SESSION_AUTHED_KEY)))
+        # ``logged_in`` gates the nav-btns + user-bar in the layout.
+        # Auth-disabled deploys (open-mode LAN sidecar) treat every
+        # request as authed; there's no login flow so hiding the nav
+        # would leave the operator stuck on a chromeless page. Auth-
+        # enabled deploys defer to the session flag.
+        ctx.setdefault(
+            "logged_in",
+            (not auth.enabled) or bool(request.session.get(SESSION_AUTHED_KEY)),
+        )
         path_parts = request.url.path.strip("/").split("/")
         nav_active = path_parts[1] if len(path_parts) > 1 and path_parts[0] == "ui" else None
         ctx.setdefault("nav_active", nav_active)
@@ -233,15 +241,47 @@ def create_app(
         request: Request,
         _auth_check: None = Depends(require_ui_auth),
     ) -> HTMLResponse:
-        """Exports view -- currently a scaffolding placeholder while
-        the port is in flight. The stdlib server's Exports page
-        remains the live surface at ``server.py``; this stub proves
-        the auth gate + layout render. Real content lands in a
-        follow-up commit."""
+        """The operator dashboard: one row per registered export
+        with status pill + progress bar. Reads ``app.state.store``
+        (same instance the JSON API mutates) and the withcache
+        URL for the subnav's "warms via ..." indicator."""
+        exports = app.state.store.list_exports()
+        withcache_url = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None
         return render(
-            "ui/_layout.html",
+            "ui/exports.html",
             request,
             nav_active="exports",
+            exports=exports,
+            withcache_url=withcache_url,
+        )
+
+    @app.get("/ui/settings", response_class=HTMLResponse)
+    def ui_settings(
+        request: Request,
+        _auth_check: None = Depends(require_ui_auth),
+    ) -> HTMLResponse:
+        """Effective-configuration view. Read-only for this pass -- all
+        knobs still come from CLI flags or environment at startup.
+        Follow-up commits add form-driven persistence for the
+        runtime-tunable ones (withcache URL, log level, admin
+        password rotation) mirroring bty's Override / Effective /
+        Default three-column pattern."""
+        withcache_url = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None
+        session_secret_from_env = bool((os.environ.get("NBDMUX_SESSION_SECRET") or "").strip())
+        return render(
+            "ui/settings.html",
+            request,
+            nav_active="settings",
+            data_dir=data_dir_str,
+            images_dir=str(app.state.images_dir),
+            withcache_url=withcache_url,
+            # nbd-server default port; the CLI accepts --nbd-port but
+            # this page only shows the effective value. When the runtime
+            # migrates and takes the CLI-arg pipe through the app
+            # constructor, this reads from that instead of the literal.
+            nbd_port=10809,
+            auth_enabled=auth.enabled,
+            session_secret_from_env=session_secret_from_env,
         )
 
     return app
