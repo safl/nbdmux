@@ -325,6 +325,44 @@ class AuthOnGatedTests(_ApiBase):
         r = self.client.post("/exports", json={"name": "demo", "file": path})
         self.assertEqual(r.status_code, 200)
 
+    def test_post_export_200_with_bearer_matching_admin_password(self) -> None:
+        """Service-to-service path: bty-web reads NBDMUX_ADMIN_PASSWORD
+        from env and sends it as ``Authorization: Bearer <pw>``. The
+        control-plane accepts that as equivalent to a session cookie
+        so cross-container callers don't have to POST /ui/login."""
+        path = self._write_file("demo.img")
+        r = self.client.post(
+            "/exports",
+            json={"name": "demo", "file": path},
+            headers={"Authorization": f"Bearer {TEST_PASSWORD}"},
+        )
+        self.assertEqual(r.status_code, 200)
+
+    def test_post_export_401_with_bearer_mismatch(self) -> None:
+        """A wrong Bearer must still 401 -- constant-time compare
+        against the configured admin password."""
+        path = self._write_file("demo.img")
+        r = self.client.post(
+            "/exports",
+            json={"name": "demo", "file": path},
+            headers={"Authorization": "Bearer wrong-pw"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_delete_export_204_with_bearer(self) -> None:
+        """DELETE mirrors POST: Bearer works for the write path."""
+        # Seed a row via a session so we have something to delete.
+        self._login()
+        path = self._write_file("demo.img")
+        self.client.post("/exports", json={"name": "demo", "file": path})
+        # New client to drop the session cookie; use Bearer instead.
+        self.client.cookies.clear()
+        r = self.client.delete(
+            "/exports/demo",
+            headers={"Authorization": f"Bearer {TEST_PASSWORD}"},
+        )
+        self.assertEqual(r.status_code, 204)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

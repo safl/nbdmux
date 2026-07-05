@@ -95,14 +95,27 @@ def register_api_routes(
 
         - No password configured (``auth.enabled = False``): every
           route is open (single-tenant LAN deploy).
-        - Password configured + session cookie present: OK.
-        - Password configured + no session: 401 with a JSON body
+        - Password configured + session cookie present: OK
+          (browser / operator UI path).
+        - Password configured + ``Authorization: Bearer <pw>``
+          header carrying the same value as
+          ``$NBDMUX_ADMIN_PASSWORD``: OK (service-to-service path;
+          bty-web reads the env var and posts on ``warm_export``).
+        - Password configured + neither: 401 with a JSON body
           (not a redirect -- these routes are JSON, not UI).
+
+        Bearer is compared in constant time so a slow-drift timing
+        attacker on the LAN can't shave characters. The session
+        cookie is unchanged; the Bearer path is additive.
         """
         if not auth.enabled:
             return
-        if not request.session.get(session_authed_key):
-            raise HTTPException(status_code=401, detail="auth required")
+        if request.session.get(session_authed_key):
+            return
+        header = request.headers.get("Authorization") or ""
+        if header.startswith("Bearer ") and auth.check_bearer(header[len("Bearer ") :]):
+            return
+        raise HTTPException(status_code=401, detail="auth required")
 
     # ---------- GET /exports (open, no auth) ------------------------------
 

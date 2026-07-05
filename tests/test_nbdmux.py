@@ -106,6 +106,15 @@ class TestAuth(unittest.TestCase):
         a = server.Auth(b"k", None)
         self.assertFalse(a.enabled)
         self.assertFalse(a.check_password("anything"))
+        self.assertFalse(a.check_bearer("anything"))
+
+    def test_bearer_check(self):
+        """Bearer path uses constant-time compare against the same
+        admin password ``check_password`` gates the UI login on."""
+        a = server.Auth(b"k", "letmein")
+        self.assertTrue(a.check_bearer("letmein"))
+        self.assertFalse(a.check_bearer("wrong"))
+        self.assertFalse(a.check_bearer(""))
 
 
 # --------------------------------------------------------------------------
