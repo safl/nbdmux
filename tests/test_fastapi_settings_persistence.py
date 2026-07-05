@@ -1,13 +1,11 @@
 """TestClient tests for Settings persistence (withcache URL + log level).
 
-Sixth checkpoint of the v0.3.0 port. Pins the persistent-override
-half of the Warming card so a Settings save writes to the DB, the
-next render reflects it, and the process env stays in sync for the
-Warmer thread (which reads env directly).
-
-Split across the settings-store unit tests + the /admin/settings/
-warming form tests + the /ui/settings render coverage. Runs under
-``make test`` alongside the legacy suite.
+Pins the persistent-override half of the Warming card: a Settings
+save writes to the DB, the next render reflects it, and the
+process env stays in sync for the Warmer thread (which reads env
+directly). Split across the settings-store unit tests + the
+/admin/settings/warming form tests + the /ui/settings render
+coverage.
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 try:
     from fastapi.testclient import TestClient  # noqa: E402
 except ImportError:  # pragma: no cover
-    raise unittest.SkipTest("fastapi + httpx not available (port scaffolding deps)") from None
+    raise unittest.SkipTest("fastapi + httpx not installed") from None
 
 from nbdmux import _settings_store  # noqa: E402
 from nbdmux._app import create_app  # noqa: E402

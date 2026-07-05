@@ -1,10 +1,9 @@
 """FastAPI JSON control-plane wire-contract tests.
 
-Pins the ``/exports`` verbs on the FastAPI-backed app so a
-regression in field names, status codes, or auth semantics can't
-land quietly. Bty consumes this surface from a sibling container
-via :mod:`nbdmux.client`; the shape here MUST stay byte-identical
-across the stdlib -> FastAPI migration.
+Pins the ``/exports`` verbs so a regression in field names, status
+codes, or auth semantics can't land quietly. Bty consumes this
+surface from a sibling container via :mod:`nbdmux.client`; keep
+the shape stable.
 
 Covers:
 
@@ -42,7 +41,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 try:
     from fastapi.testclient import TestClient  # noqa: E402
 except ImportError:  # pragma: no cover
-    raise unittest.SkipTest("fastapi + httpx not available (port scaffolding deps)") from None
+    raise unittest.SkipTest("fastapi + httpx not installed") from None
 
 from nbdmux._app import create_app  # noqa: E402
 
@@ -306,7 +305,7 @@ class AuthOnGatedTests(_ApiBase):
     def test_get_exports_stays_open_even_with_auth_enabled(self) -> None:
         """bty polls this from a sibling container without a session;
         the read path stays open regardless of admin-password
-        configuration. Pins the pre-port behaviour."""
+        configuration."""
         r = self.client.get("/exports")
         self.assertEqual(r.status_code, 200)
 

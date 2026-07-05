@@ -5,8 +5,8 @@ same rows the JSON /exports control plane does, validation errors
 303 back to /ui/exports with ``?error=<msg>``, and the auth gate
 mirrors the JSON API's semantics.
 
-Written as unittest.TestCase to match the rest of the port's
-test scaffolding (``make test`` = ``python3 -m unittest discover``).
+Written as unittest.TestCase to match the rest of the suite
+(``make test`` = ``python3 -m unittest discover``).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 try:
     from fastapi.testclient import TestClient  # noqa: E402
 except ImportError:  # pragma: no cover
-    raise unittest.SkipTest("fastapi + httpx not available (port scaffolding deps)") from None
+    raise unittest.SkipTest("fastapi + httpx not installed") from None
 
 from nbdmux._app import create_app  # noqa: E402
 

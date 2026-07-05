@@ -93,10 +93,9 @@ def resolve_withcache_url(conn: sqlite3.Connection) -> str | None:
     """DB override > $NBDMUX_WITHCACHE_URL > None.
 
     None means "warm-via-src_url will 400 with the configuration
-    error"; pre-warmed ``{name, file}`` POSTs still work. Same shape
-    the pre-port stdlib ``server.main`` had via env-only reads;
-    persistent overrides let operators tune via UI without a
-    redeploy."""
+    error"; pre-warmed ``{name, file}`` POSTs still work. The DB
+    override lets operators tune via the Settings page without
+    dropping an env / systemd unit."""
     override = get(conn, KEY_WITHCACHE_URL)
     if override:
         return override

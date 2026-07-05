@@ -1,6 +1,6 @@
-"""FastAPI-port scaffolding smoke tests.
+"""FastAPI smoke tests.
 
-Pins the first-checkpoint behaviour of the v0.3.0 port:
+Pins the baseline shape of the operator control plane:
 
 - /healthz returns 200 + a JSON body naming service + version.
 - /ui/login renders on GET without auth.
@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover
     # Older matrix rows / stripped venvs without the port deps skip
     # this file rather than hard-erroring at collection time.
-    raise unittest.SkipTest("fastapi + httpx not available (port scaffolding deps)") from None
+    raise unittest.SkipTest("fastapi + httpx not installed") from None
 
 from nbdmux._app import create_app  # noqa: E402
 
@@ -62,10 +62,9 @@ class FastAPIScaffoldTests(unittest.TestCase):
         self.assertIn(r.status_code, (200, 303))
 
     def test_healthz_returns_200_json(self) -> None:
-        """The pre-port stdlib server's /healthz returned 200 + a
-        single-line JSON body naming the service. The FastAPI port
-        preserves that shape byte-identically so container probes and
-        bty-web's reachability pill don't need to change."""
+        """/healthz returns 200 + a single-line JSON body naming the
+        service. Container probes and bty-web's reachability pill
+        key on this shape."""
         r = self.client.get("/healthz")
         self.assertEqual(r.status_code, 200)
         body = r.json()

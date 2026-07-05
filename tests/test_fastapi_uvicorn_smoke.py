@@ -39,9 +39,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 # The lifespan starts NbdServer, which spawns the real nbd-server
 # binary. Skip the smoke test when the binary isn't installed --
 # this test's purpose is proving uvicorn boots the daemon end to
-# end, and the pre-port stdlib main() had the same requirement
-# (it also spawned nbd-server unconditionally). CI installs
-# nbd-server via ``apt-get install nbd-server`` in the runner setup.
+# end. CI installs nbd-server via ``apt-get install nbd-server``
+# in the runner setup.
 _NBD_SERVER_BIN = shutil.which("nbd-server")
 
 
@@ -134,7 +133,7 @@ class UvicornRuntimeSmokeTests(unittest.TestCase):
         proc = self._spawn()
         try:
             _wait_for_http(f"http://127.0.0.1:{self._port}/healthz", timeout=15.0)
-            # /healthz JSON shape parity with the pre-port stdlib server.
+            # /healthz JSON shape probes key on.
             with urllib.request.urlopen(  # noqa: S310
                 f"http://127.0.0.1:{self._port}/healthz", timeout=2.0
             ) as resp:
