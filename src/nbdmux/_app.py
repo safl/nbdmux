@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import __version__
+from . import __version__, _settings_store
 from ._api import register_api_routes
 from .server import Auth, Store, _detect_format, resolve_secret
 from .server import _valid_export_name as _valid_export_name_local
@@ -190,6 +190,11 @@ def create_app(
     app.state.data_dir = data_dir_str
     app.state.nbd_port = nbd_port
     Path(app.state.images_dir).mkdir(parents=True, exist_ok=True)
+    # Ensure the settings table exists so the Settings render + save
+    # handlers don't crash on a fresh state.db. Store owns the exports
+    # table; settings sits alongside it in the same DB.
+    with app.state.store.conn() as _c:
+        _settings_store.init(_c)
 
     register_api_routes(app, auth=auth, session_authed_key=SESSION_AUTHED_KEY)
 
@@ -389,23 +394,50 @@ def create_app(
     @app.get("/ui/settings", response_class=HTMLResponse)
     def ui_settings(
         request: Request,
+        saved: str | None = None,
+        error: str | None = None,
         _auth_check: None = Depends(require_ui_auth),
     ) -> HTMLResponse:
-        """Effective-configuration view. Read-only for this pass -- all
-        knobs still come from CLI flags or environment at startup.
-        Follow-up commits add form-driven persistence for the
-        runtime-tunable ones (withcache URL, log level, admin
-        password rotation) mirroring bty's Override / Effective /
-        Default three-column pattern."""
-        withcache_url = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None
+        """Effective-configuration view. Warming card is now form-
+        editable (withcache URL + log level) with the Override /
+        Effective / Default three-column pattern bty uses. Save
+        writes to :mod:`_settings_store`; a rolling deploy sees the
+        new value on the next request without needing to touch env
+        or restart. Env still overrides the default when no DB
+        override is set."""
         session_secret_from_env = bool((os.environ.get("NBDMUX_SESSION_SECRET") or "").strip())
+        with app.state.store.conn() as conn:
+            withcache_url_override = _settings_store.get(conn, _settings_store.KEY_WITHCACHE_URL)
+            withcache_url_effective = _settings_store.resolve_withcache_url(conn)
+            log_level_override = _settings_store.get(conn, _settings_store.KEY_LOG_LEVEL)
+            try:
+                log_level_effective = _settings_store.resolve_log_level(conn)
+                log_level_error: str | None = None
+            except _settings_store.SettingValueError as exc:
+                # Bad stored value -- render the raw override so the
+                # operator can see + fix it, but flag the error in
+                # the ``log_level_error`` context var.
+                log_level_effective = log_level_override or ""
+                log_level_error = str(exc)
+        flash_map = {
+            "warming": "Warming settings saved.",
+        }
+        flash = flash_map.get(saved or "") if not error else error
+        flash_kind = "danger" if error else ("success" if flash else None)
         return render(
             "ui/settings.html",
             request,
             nav_active="settings",
             data_dir=data_dir_str,
             images_dir=str(app.state.images_dir),
-            withcache_url=withcache_url,
+            withcache_url_override=withcache_url_override,
+            withcache_url_effective=withcache_url_effective,
+            withcache_url_env=(os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None,
+            log_level_override=log_level_override,
+            log_level_effective=log_level_effective,
+            log_level_error=log_level_error,
+            log_level_default=_settings_store.DEFAULT_LOG_LEVEL,
+            log_levels=_settings_store.LOG_LEVELS,
             # nbd-server port threaded through from ``create_app``
             # (default 10809; CLI ``--nbd-port`` on ``server.main``
             # overrides). Reads from app.state so a rolling redeploy
@@ -413,6 +445,64 @@ def create_app(
             nbd_port=app.state.nbd_port,
             auth_enabled=auth.enabled,
             session_secret_from_env=session_secret_from_env,
+            flash=flash,
+            flash_kind=flash_kind,
+        )
+
+    @app.post("/admin/settings/warming")
+    def ui_admin_settings_warming(
+        withcache_url: str = Form(""),
+        log_level: str = Form(""),
+        _auth_check: None = Depends(require_ui_auth),
+    ) -> RedirectResponse:
+        """Persist the Warming card's two knobs. Empty string clears
+        the override so the resolver falls through to env / default;
+        non-empty stores the value verbatim (after strip).
+
+        Invalid log-level values 303 back with ``?error=<msg>`` and
+        DO NOT persist -- the resolver would raise on the next
+        Settings render anyway, and rejecting at write time keeps
+        the failure loud."""
+        wc = (withcache_url or "").strip()
+        ll = (log_level or "").strip().lower()
+        if ll and ll not in _settings_store.LOG_LEVELS:
+            import urllib.parse
+
+            msg = f"log level {ll!r} not in {_settings_store.LOG_LEVELS}"
+            return RedirectResponse(
+                url="/ui/settings?error=" + urllib.parse.quote(msg, safe=""),
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+        with app.state.store.conn() as conn:
+            if wc:
+                _settings_store.set_value(conn, _settings_store.KEY_WITHCACHE_URL, wc)
+            else:
+                _settings_store.clear(conn, _settings_store.KEY_WITHCACHE_URL)
+            if ll:
+                _settings_store.set_value(conn, _settings_store.KEY_LOG_LEVEL, ll)
+            else:
+                _settings_store.clear(conn, _settings_store.KEY_LOG_LEVEL)
+        # The Warmer thread + the JSON POST /exports validator read
+        # ``NBDMUX_WITHCACHE_URL`` from the process env directly, so
+        # persisting the DB row alone would only take effect on the
+        # next restart. Sync the env at save time so the change is
+        # live for the next request; the settings row remains the
+        # source of truth (a restart re-reads it and repopulates).
+        # Log level is boot-time only (uvicorn latches at start);
+        # persistence-only, applies after redeploy.
+        if wc:
+            os.environ["NBDMUX_WITHCACHE_URL"] = wc
+        else:
+            # Empty override -> unset the process env so the Warmer
+            # sees "not configured" for the rest of this process's
+            # lifetime. Next restart repopulates env from the
+            # systemd unit / bty.toml so an operator's explicit
+            # env value doesn't stay lost -- persistence is the
+            # source of truth while the daemon is up.
+            os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        return RedirectResponse(
+            url="/ui/settings?saved=warming#warming",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     return app
