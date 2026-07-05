@@ -11,14 +11,17 @@ Two surfaces:
   reimplementing the HTTP API.
 
 Designed for the same niche as ``withcache``: a small lab, a single
-sidecar container, no third-party Python deps. The system-level
-dependency is ``nbd-server`` (Debian / Ubuntu: ``apt install
-nbd-server``; Fedora: ``dnf install nbd``).
+sidecar container. Since v0.3.0 the daemon runs on FastAPI +
+Jinja + Bootstrap 5 + htmx (matching bty-web + the eventual
+withcache port); ``nbdmux.client`` stays stdlib-only so downstream
+consumers (bty) don't inherit the framework floor. The system-
+level dependency is ``nbd-server`` (Debian / Ubuntu:
+``apt install nbd-server``; Fedora: ``dnf install nbd``).
 """
 
 from .client import add_export, is_healthy, list_exports, remove_export, warm_export
 
-__version__ = "0.2.19"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
