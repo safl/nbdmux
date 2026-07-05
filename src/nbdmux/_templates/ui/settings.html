@@ -113,49 +113,101 @@
 </div>
 
 <div class="card mb-3" id="warming">
-    <div class="card-header bg-light fw-semibold py-2">
-        <i class="bi bi-cloud-download me-1"></i>Warming pipeline
+    <div class="card-header bg-light fw-semibold py-2 d-flex align-items-center">
+        <span><i class="bi bi-cloud-download me-1"></i>Warming pipeline</span>
     </div>
+    <form method="post" action="/admin/settings/warming" class="m-0">
     <div class="table-responsive">
         <table class="table mb-0 align-middle">
             <thead class="table-light">
                 <tr>
-                    <th>Setting</th>
-                    <th>Effective</th>
-                    <th>Source</th>
+                    <th style="width: 18%;">Setting</th>
+                    <th style="width: 32%;">Override</th>
+                    <th style="width: 20%;">Effective</th>
                     <th>Notes</th>
                 </tr>
             </thead>
             <tbody>
+                {# Withcache URL: form-editable override. Empty ->
+                   fall through to env / unset. Effective column
+                   shows what the resolver returns. #}
                 <tr>
                     <td><i class="bi bi-globe me-1"></i>Withcache URL</td>
                     <td>
-                        {% if withcache_url %}
-                        <code>{{ withcache_url }}</code>
+                        <input type="url" class="form-control form-control-sm font-monospace"
+                               name="withcache_url"
+                               placeholder="http://withcache:8081"
+                               value="{{ withcache_url_override or '' }}">
+                    </td>
+                    <td>
+                        {% if withcache_url_effective %}
+                        <code class="small">{{ withcache_url_effective }}</code>
                         {% else %}
                         <span class="badge bg-warning text-dark">not configured</span>
                         {% endif %}
                     </td>
-                    <td><span class="badge bg-light text-dark border">env NBDMUX_WITHCACHE_URL</span></td>
                     <td class="text-muted small">
-                        Nbdmux only warms via withcache. Empty disables the
-                        <code>src_url</code> POST shape; pre-warmed
-                        <code>file</code> exports still work.
+                        Nbdmux only warms via withcache. Override wins over
+                        <code>$NBDMUX_WITHCACHE_URL</code>; empty falls back
+                        to env / disabled.
+                        {% if withcache_url_env %}
+                        Env currently: <code>{{ withcache_url_env }}</code>.
+                        {% endif %}
                     </td>
                 </tr>
+                {# Log level: dropdown of the closed uvicorn set. Persists
+                   in the DB but applies on next restart (uvicorn latches
+                   the level at boot). #}
+                <tr>
+                    <td><i class="bi bi-file-text me-1"></i>Log level</td>
+                    <td>
+                        <select name="log_level" class="form-select form-select-sm">
+                            <option value="">(no override; use env / default)</option>
+                            {% for lvl in log_levels %}
+                            <option value="{{ lvl }}"
+                                    {% if log_level_override == lvl %}selected{% endif %}>
+                                {{ lvl }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </td>
+                    <td>
+                        {% if log_level_error %}
+                        <span class="badge bg-danger" title="{{ log_level_error }}">invalid</span>
+                        {% else %}
+                        <code>{{ log_level_effective }}</code>
+                        {% endif %}
+                    </td>
+                    <td class="text-muted small">
+                        Uvicorn / logging level. Applies on next restart
+                        (uvicorn latches at boot). Default:
+                        <code>{{ log_level_default }}</code>.
+                    </td>
+                </tr>
+                {# NBD port stays read-only -- it's boot-time only and
+                   changing it would break the ramboot-init clients
+                   already connected. #}
                 <tr>
                     <td><i class="bi bi-broadcast me-1"></i>NBD listener port</td>
-                    <td><code>{{ nbd_port }}</code></td>
-                    <td><span class="badge bg-light text-dark border">CLI --nbd-port</span></td>
+                    <td colspan="2">
+                        <code>{{ nbd_port }}</code>
+                        <span class="badge bg-light text-dark border ms-2">CLI --nbd-port</span>
+                    </td>
                     <td class="text-muted small">
-                        The nbd-server subprocess listens here for TCP
-                        connections. bty-ramboot-init clients connect on this
-                        port after the ipxe chain flips to <em>ramboot</em>.
+                        The nbd-server subprocess listens here. Read-only:
+                        changing it in flight would break connected
+                        ramboot-init clients.
                     </td>
                 </tr>
             </tbody>
         </table>
     </div>
+    <div class="card-footer bg-light text-end py-2">
+        <button type="submit" class="btn btn-sm btn-primary">
+            <i class="bi bi-save me-1"></i>Save warming settings
+        </button>
+    </div>
+    </form>
 </div>
 
 <div class="card mb-3" id="auth">
