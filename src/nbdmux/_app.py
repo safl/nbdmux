@@ -32,7 +32,8 @@ from jinja2 import Environment, FileSystemLoader
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import __version__
-from .server import Auth, resolve_secret
+from ._api import register_api_routes
+from .server import Auth, Store, resolve_secret
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _TEMPLATES_DIR = Path(__file__).parent / "_templates"
@@ -63,10 +64,37 @@ def _build_jinja(templates_dir: Path) -> Environment:
     return env
 
 
+class _NoopWarmer:
+    """Stub :class:`~nbdmux.server.Warmer` for the FastAPI app that
+    isn't yet the runtime daemon. The real Warmer thread starts
+    from ``server.main()`` and drains queued warms out-of-process;
+    inside the FastAPI TestClient path we accept enqueue calls but
+    don't spawn a thread. When the port migrates the runtime, the
+    lifespan hook will pass a real Warmer here."""
+
+    def enqueue(self, name: str) -> None:  # pragma: no cover - stub
+        del name
+
+
+class _NoopNbdServer:
+    """Stub :class:`~nbdmux.server.NbdServer` for the FastAPI app.
+    Same reasoning as :class:`_NoopWarmer`: reload calls no-op so
+    the JSON handlers can call ``nbd.reload(store.list_ready())``
+    exactly like the pre-port code does, without launching an
+    actual nbd-server subprocess in tests."""
+
+    def reload(self, exports: list[Any]) -> None:  # pragma: no cover - stub
+        del exports
+
+
 def create_app(
     *,
     data_dir: str | os.PathLike[str],
     secret_key: bytes | None = None,
+    store: Store | None = None,
+    warmer: Any | None = None,
+    nbd: Any | None = None,
+    images_dir: str | os.PathLike[str] | None = None,
 ) -> FastAPI:
     """Build the FastAPI application for the nbdmux control plane.
 
@@ -112,6 +140,22 @@ def create_app(
     )
 
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    # Runtime objects the JSON handlers reach via ``request.app.state``.
+    # Store writes a real state.db under data_dir so tests exercise the
+    # SQLite path unchanged. Warmer + NbdServer default to no-op stubs
+    # because the runtime daemon (still stdlib server.py) owns the
+    # actual thread + subprocess. When the port migrates the runtime,
+    # a lifespan hook will hand real instances in here.
+    app.state.store = store if store is not None else Store(data_dir_str)
+    app.state.warmer = warmer if warmer is not None else _NoopWarmer()
+    app.state.nbd = nbd if nbd is not None else _NoopNbdServer()
+    app.state.images_dir = (
+        str(images_dir) if images_dir is not None else str(Path(data_dir_str) / "images")
+    )
+    Path(app.state.images_dir).mkdir(parents=True, exist_ok=True)
+
+    register_api_routes(app, auth=auth, session_authed_key=SESSION_AUTHED_KEY)
 
     def render(name: str, request: Request, **ctx: Any) -> HTMLResponse:
         """Render a Jinja template + always-injected context.
