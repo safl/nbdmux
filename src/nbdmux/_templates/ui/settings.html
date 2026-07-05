@@ -1,0 +1,216 @@
+{% extends "ui/_layout.html" %}
+{% block title %}Settings - nbdmux{% endblock %}
+
+{% block subnav %}
+<nav class="navbar subnav-strip" aria-label="Section sub-navigation">
+    <div class="container">
+        <span class="d-flex align-items-center flex-wrap">
+            <a href="#identity">Identity</a>
+            <span class="vr"></span>
+            <a href="#paths">Storage paths</a>
+            <span class="vr"></span>
+            <a href="#warming">Warming</a>
+            <span class="vr"></span>
+            <a href="#auth">Auth</a>
+        </span>
+    </div>
+</nav>
+{% endblock %}
+
+{% block intro %}
+<div class="alert alert-secondary small mb-3">
+    Effective configuration for this nbdmux instance. All knobs
+    are set via CLI flags or environment variables at daemon
+    startup; the read-only view here matches bty's Settings page
+    <em>Override / Effective / Default</em> shape so operators
+    moving between the trio consoles read one grammar. Persistent
+    edits land in a follow-up.
+</div>
+{% endblock %}
+
+{% block content %}
+{# Card shape mirrors bty's Settings page (a section per group).
+   Each row: label, effective value (monospace), source (Env /
+   CLI / Default), and a short description. Grouped by concern
+   so an operator scanning for "where's the withcache URL"
+   lands on the Warming card without reading everything. #}
+
+<div class="card mb-3" id="identity">
+    <div class="card-header bg-light fw-semibold py-2">
+        <i class="bi bi-info-circle me-1"></i>Identity
+    </div>
+    <div class="table-responsive">
+        <table class="table mb-0 align-middle">
+            <thead class="table-light">
+                <tr>
+                    <th>Setting</th>
+                    <th>Effective</th>
+                    <th>Source</th>
+                    <th>Notes</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><i class="bi bi-tag me-1"></i>nbdmux version</td>
+                    <td><code>{{ version }}</code></td>
+                    <td><span class="badge bg-light text-dark border">package</span></td>
+                    <td class="text-muted small">Container image tag / PyPI release.</td>
+                </tr>
+                <tr>
+                    <td><i class="bi bi-github me-1"></i>Project</td>
+                    <td>
+                        <a href="https://github.com/safl/nbdmux"
+                           class="text-decoration-none font-monospace">
+                            github.com/safl/nbdmux
+                        </a>
+                    </td>
+                    <td><span class="badge bg-light text-dark border">static</span></td>
+                    <td class="text-muted small">Release notes + wire-format docs.</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card mb-3" id="paths">
+    <div class="card-header bg-light fw-semibold py-2">
+        <i class="bi bi-hdd me-1"></i>Storage paths
+    </div>
+    <div class="table-responsive">
+        <table class="table mb-0 align-middle">
+            <thead class="table-light">
+                <tr>
+                    <th>Setting</th>
+                    <th>Effective</th>
+                    <th>Source</th>
+                    <th>Notes</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><i class="bi bi-folder me-1"></i>Data directory</td>
+                    <td class="font-monospace">{{ data_dir }}</td>
+                    <td><span class="badge bg-light text-dark border">CLI --data-dir</span></td>
+                    <td class="text-muted small">
+                        Holds <code>state.db</code>, <code>session-secret</code>,
+                        <code>images/</code>. Bind-mount here for cross-service
+                        visibility with bty-web's ramboot pipeline.
+                    </td>
+                </tr>
+                <tr>
+                    <td><i class="bi bi-image me-1"></i>Images directory</td>
+                    <td class="font-monospace">{{ images_dir }}</td>
+                    <td><span class="badge bg-light text-dark border">derived</span></td>
+                    <td class="text-muted small">
+                        Warm-created <code>&lt;name&gt;.img</code> land here.
+                        Pre-warmed exports point at operator paths anywhere on
+                        the container filesystem.
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card mb-3" id="warming">
+    <div class="card-header bg-light fw-semibold py-2">
+        <i class="bi bi-cloud-download me-1"></i>Warming pipeline
+    </div>
+    <div class="table-responsive">
+        <table class="table mb-0 align-middle">
+            <thead class="table-light">
+                <tr>
+                    <th>Setting</th>
+                    <th>Effective</th>
+                    <th>Source</th>
+                    <th>Notes</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><i class="bi bi-globe me-1"></i>Withcache URL</td>
+                    <td>
+                        {% if withcache_url %}
+                        <code>{{ withcache_url }}</code>
+                        {% else %}
+                        <span class="badge bg-warning text-dark">not configured</span>
+                        {% endif %}
+                    </td>
+                    <td><span class="badge bg-light text-dark border">env NBDMUX_WITHCACHE_URL</span></td>
+                    <td class="text-muted small">
+                        Nbdmux only warms via withcache. Empty disables the
+                        <code>src_url</code> POST shape; pre-warmed
+                        <code>file</code> exports still work.
+                    </td>
+                </tr>
+                <tr>
+                    <td><i class="bi bi-broadcast me-1"></i>NBD listener port</td>
+                    <td><code>{{ nbd_port }}</code></td>
+                    <td><span class="badge bg-light text-dark border">CLI --nbd-port</span></td>
+                    <td class="text-muted small">
+                        The nbd-server subprocess listens here for TCP
+                        connections. bty-ramboot-init clients connect on this
+                        port after the ipxe chain flips to <em>ramboot</em>.
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card mb-3" id="auth">
+    <div class="card-header bg-light fw-semibold py-2">
+        <i class="bi bi-shield-lock me-1"></i>Authentication
+    </div>
+    <div class="table-responsive">
+        <table class="table mb-0 align-middle">
+            <thead class="table-light">
+                <tr>
+                    <th>Setting</th>
+                    <th>Effective</th>
+                    <th>Source</th>
+                    <th>Notes</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><i class="bi bi-key me-1"></i>Admin password</td>
+                    <td>
+                        {% if auth_enabled %}
+                        <span class="badge bg-success"><i class="bi bi-check-lg me-1"></i>configured</span>
+                        {% else %}
+                        <span class="badge bg-warning text-dark">
+                            <i class="bi bi-unlock me-1"></i>open mode
+                        </span>
+                        {% endif %}
+                    </td>
+                    <td><span class="badge bg-light text-dark border">env NBDMUX_ADMIN_PASSWORD</span></td>
+                    <td class="text-muted small">
+                        When set, POST / DELETE <code>/exports</code> and the UI
+                        gate on a session cookie. When unset, the control plane
+                        is open (LAN-only deploy).
+                        GET <code>/exports</code> stays open regardless so bty
+                        can poll from a sibling container.
+                    </td>
+                </tr>
+                <tr>
+                    <td><i class="bi bi-fingerprint me-1"></i>Session secret</td>
+                    <td>
+                        {% if session_secret_from_env %}
+                        <span class="badge bg-info text-dark">from env</span>
+                        {% else %}
+                        <code>&lt;data-dir&gt;/session-secret</code>
+                        {% endif %}
+                    </td>
+                    <td><span class="badge bg-light text-dark border">env NBDMUX_SESSION_SECRET</span></td>
+                    <td class="text-muted small">
+                        HMAC key signing the <code>nbdmux-token</code> cookie.
+                        Persisted to disk when env unset so cookies survive
+                        restarts.
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
