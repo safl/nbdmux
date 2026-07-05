@@ -21,12 +21,11 @@ Wire-contract invariants pinned:
   name is unknown (the client-side wrapper treats 404 as no-op).
 - ``GET /export/{name}`` returns the single record or 404.
 
-The auth gate mirrors the pre-port control-plane semantics:
-control endpoints are open when ``NBDMUX_ADMIN_PASSWORD`` is
-unset (LAN-only deploy), and require a valid session cookie
-otherwise. Read routes (``GET /exports``, ``GET /healthz``) stay
-open regardless -- bty needs to poll ``list_exports`` from a
-sibling container without minting a session.
+Auth gate: control endpoints are open when ``NBDMUX_ADMIN_PASSWORD``
+is unset (single-tenant LAN deploy), and require a valid session
+cookie otherwise. Read routes (``GET /exports``, ``GET /healthz``)
+stay open regardless -- bty polls ``list_exports`` from a sibling
+container without minting a session.
 """
 
 from __future__ import annotations
@@ -76,9 +75,7 @@ def register_api_routes(
 
     Runtime objects (``store``, ``warmer``, ``nbd``, ``images_dir``)
     are read from ``app.state`` at request time so tests can swap
-    them in a fixture without recreating the app. The pre-port
-    stdlib handler kept them on ``self``; ``app.state`` is
-    FastAPI's equivalent single-place attachment point.
+    them in a fixture without recreating the app.
     """
 
     def _get_store(app_: FastAPI) -> _StoreProto:
@@ -97,8 +94,7 @@ def register_api_routes(
         """Auth dependency for the mutation routes.
 
         - No password configured (``auth.enabled = False``): every
-          route is open. Matches the pre-port ``_control_authed``
-          "open mode" semantics for LAN-only deploys.
+          route is open (single-tenant LAN deploy).
         - Password configured + session cookie present: OK.
         - Password configured + no session: 401 with a JSON body
           (not a redirect -- these routes are JSON, not UI).
@@ -114,16 +110,16 @@ def register_api_routes(
     def list_exports(request: Request) -> list[dict[str, Any]]:
         """Return every registered export as a list of records. Open
         route: bty polls this from a sibling container without a
-        session (the pre-port behaviour). No pagination -- the export
-        set is small (dozens at most) and consumers scan the full
-        list to find one by name."""
+        session. No pagination -- the export set is small (dozens
+        at most) and consumers scan the full list to find one by
+        name."""
         return _get_store(request.app).list_exports()
 
     @app.get("/export/{name}", response_model=None)
     def get_export(name: str, request: Request) -> dict[str, Any]:
         """Return a single export record, or 404 when the name is
-        unknown. Kept for parity with the pre-port stdlib surface;
-        no bty caller uses it today."""
+        unknown. No bty caller uses it today; kept for the client
+        library + operator curl surface."""
         record = _get_store(request.app).get_export(name)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no export named {name!r}")
@@ -151,9 +147,8 @@ def register_api_routes(
           must be set (nbdmux only warms via withcache).
 
         Validation errors return HTTP 400 with a JSON body; the
-        pre-port stdlib handler had the exact same shape and the
-        client library at ``nbdmux.client.warm_export`` catches
-        by status code.
+        client library at ``nbdmux.client.warm_export`` catches by
+        status code.
         """
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="body must be a JSON object")

@@ -870,13 +870,11 @@ def _ensure_probe_export(store: Store, data_dir: str) -> None:
 def main() -> int:
     """Daemon entry point.
 
-    v0.3.0 (this port): FastAPI + uvicorn. The stdlib http.server
-    ``_ThreadingHTTPServer`` + Handler stay in this module as an
-    escape hatch for the pre-port unit tests that spin their own
-    fixture, but the runtime daemon uses ``uvicorn.run`` against
-    :func:`nbdmux._app.create_app`. Warmer + NbdServer lifecycle
-    (start / stop / resume-pending) moves to the FastAPI lifespan
-    hook; SIGTERM / SIGINT handling is uvicorn's.
+    Constructs Store + Warmer + NbdServer, hands them to
+    :func:`nbdmux._app.create_app`, then boots uvicorn. Warmer +
+    NbdServer lifecycle (start / stop / resume-pending) runs from
+    the FastAPI lifespan hook; SIGTERM / SIGINT handling is
+    uvicorn's.
     """
     import uvicorn
 

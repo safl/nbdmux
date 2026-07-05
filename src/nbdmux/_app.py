@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -62,23 +62,21 @@ def _build_jinja(templates_dir: Path) -> Environment:
 
 
 class _NoopWarmer:
-    """Stub :class:`~nbdmux.server.Warmer` for the FastAPI app that
-    isn't yet the runtime daemon. The real Warmer thread starts
-    from ``server.main()`` and drains queued warms out-of-process;
-    inside the FastAPI TestClient path we accept enqueue calls but
-    don't spawn a thread. When the port migrates the runtime, the
-    lifespan hook will pass a real Warmer here."""
+    """Test-fixture stub for :class:`~nbdmux.server.Warmer`. The
+    TestClient path accepts enqueue calls but doesn't spawn a
+    worker thread; the daemon path passes a real Warmer via the
+    lifespan hook."""
 
     def enqueue(self, name: str) -> None:  # pragma: no cover - stub
         del name
 
 
 class _NoopNbdServer:
-    """Stub :class:`~nbdmux.server.NbdServer` for the FastAPI app.
-    Same reasoning as :class:`_NoopWarmer`: reload calls no-op so
-    the JSON handlers can call ``nbd.reload(store.list_ready())``
-    exactly like the pre-port code does, without launching an
-    actual nbd-server subprocess in tests."""
+    """Test-fixture stub for :class:`~nbdmux.server.NbdServer`.
+    Reload calls no-op so JSON handlers can call
+    ``nbd.reload(store.list_ready())`` without launching an
+    ``nbd-server`` subprocess; the daemon path passes a real
+    NbdServer via the lifespan hook."""
 
     def reload(self, exports: list[Any]) -> None:  # pragma: no cover - stub
         del exports
@@ -97,11 +95,10 @@ def create_app(
 ) -> FastAPI:
     """Build the FastAPI application for the nbdmux control plane.
 
-    ``data_dir`` is the persistent state directory (where the
-    stdlib server writes ``state.db`` + ``session-secret``). We
-    borrow ``resolve_secret`` from the legacy module so a running
-    daemon and the ported UI share one signing key across the
-    migration.
+    ``data_dir`` is the persistent state directory (``state.db`` +
+    ``session-secret`` live here). Signing-key resolution goes
+    through :func:`nbdmux.server.resolve_secret` so a rolling
+    deploy keeps existing session cookies valid.
 
     ``secret_key`` overrides the persisted secret; tests pass a
     stable bytes value so cookies stay valid across the fixture's
@@ -128,9 +125,9 @@ def create_app(
         if run_lifecycle:
             _app.state.nbd.start(_app.state.store.list_ready_exports())
             _app.state.warmer.start()
-            # Resume rows that were mid-warm at the last shutdown; the
-            # Warmer walks each through fetch -> decompress -> ready
-            # in the same order the pre-port stdlib server did.
+            # Resume rows that were mid-warm at the last shutdown;
+            # the Warmer walks each through fetch -> decompress ->
+            # ready.
             for row in _app.state.store.list_pending_exports():
                 _app.state.warmer.enqueue(row["name"])
             print(
@@ -161,9 +158,8 @@ def create_app(
     )
 
     # SessionMiddleware signs a cookie so tests + the UI can share
-    # one login flow. Cookie name matches the pre-port
-    # ``nbdmux-token`` shape so a rolling deploy doesn't invalidate
-    # existing browser sessions.
+    # one login flow. Cookie name is ``nbdmux-token`` (matching the
+    # ``bty-token`` + ``withcache-token`` trio shape).
     app.add_middleware(
         SessionMiddleware,
         secret_key=secret.decode("utf-8", errors="replace"),
@@ -225,9 +221,8 @@ def create_app(
         routes. Raises :class:`NotAuthenticated`, which the
         exception handler turns into a 303 to ``/ui/login``."""
         if not auth.enabled:
-            # No password configured: every /ui/* route is public.
-            # Same as the pre-port behaviour when
-            # ``NBDMUX_ADMIN_PASSWORD`` is unset.
+            # ``NBDMUX_ADMIN_PASSWORD`` unset: every /ui/* route is
+            # public (single-tenant LAN deploy).
             return
         if not request.session.get(SESSION_AUTHED_KEY):
             raise NotAuthenticated()
@@ -243,7 +238,7 @@ def create_app(
         """Liveness probe. Returns 200 + a static JSON body so the
         sibling services' probes (bty-web's Settings > Ramboot
         reachability pill, container orchestrators) can key on the
-        HTTP status. Same shape the pre-port stdlib server emitted."""
+        HTTP status."""
         return JSONResponse({"status": "ok", "service": "nbdmux", "version": __version__})
 
     # ---------- Login / logout ------------------------------------------
@@ -506,12 +501,3 @@ def create_app(
         )
 
     return app
-
-
-def _bind_callable(app: FastAPI, name: str, fn: Callable[..., Any]) -> None:
-    """Attach an operational helper to the app's state so tests can
-    reach into it via ``client.app.state.<name>``. Kept simple; the
-    lifespan-driven wiring for the Warmer + nbd-server subprocess
-    lands with the full port."""
-    setattr(app.state, name, fn)
-    raise NotImplementedError  # placeholder; called from follow-up code path

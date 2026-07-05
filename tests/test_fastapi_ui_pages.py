@@ -1,15 +1,8 @@
 """TestClient tests for /ui/exports and /ui/settings.
 
-Third checkpoint of the v0.3.0 port: the operator-facing HTML
-pages. Exports moves off the pre-port stdlib server's inline-HTML
-dashboard to a Jinja template; Settings is brand-new (nbdmux has
-never had a Settings page before this PR -- the trio-parity audit
-called it out as the "bty is polished, others are half-baked"
-asymmetry).
-
-Both pages are read-only for this pass. Admin forms + persistence
-follow after the runtime cuts over so operators can actually
-reach these pages on a live daemon.
+Covers the operator-facing HTML pages: Exports (Jinja + Bootstrap
+table + status pills + progress bars) and Settings (identity +
+storage paths + resolved withcache URL + auth state).
 
 Written as ``unittest.TestCase`` so ``make test``
 (``python3 -m unittest discover``) picks them up alongside the
@@ -30,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 try:
     from fastapi.testclient import TestClient  # noqa: E402
 except ImportError:  # pragma: no cover
-    raise unittest.SkipTest("fastapi + httpx not available (port scaffolding deps)") from None
+    raise unittest.SkipTest("fastapi + httpx not installed") from None
 
 from nbdmux._app import create_app  # noqa: E402
 
