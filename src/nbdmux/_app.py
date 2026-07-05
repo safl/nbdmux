@@ -29,7 +29,8 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from . import __version__
 from ._api import register_api_routes
-from .server import Auth, Store, resolve_secret
+from .server import Auth, Store, _detect_format, resolve_secret
+from .server import _valid_export_name as _valid_export_name_local
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _TEMPLATES_DIR = Path(__file__).parent / "_templates"
@@ -274,12 +275,16 @@ def create_app(
     @app.get("/ui/exports", response_class=HTMLResponse)
     def ui_exports(
         request: Request,
+        error: str | None = None,
         _auth_check: None = Depends(require_ui_auth),
     ) -> HTMLResponse:
         """The operator dashboard: one row per registered export
         with status pill + progress bar. Reads ``app.state.store``
         (same instance the JSON API mutates) and the withcache
-        URL for the subnav's "warms via ..." indicator."""
+        URL for the subnav's "warms via ..." indicator. The
+        ``?error=`` query param carries the flash from a failed
+        admin-form submission back into the render context so the
+        redirect target shows the reason inline."""
         exports = app.state.store.list_exports()
         withcache_url = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None
         return render(
@@ -288,6 +293,97 @@ def create_app(
             nav_active="exports",
             exports=exports,
             withcache_url=withcache_url,
+            flash=error,
+            flash_kind="danger" if error else None,
+        )
+
+    # ---------- Admin form endpoints ------------------------------------
+    #
+    # Form-encoded siblings of the JSON /exports control plane so
+    # the operator UI can create + delete exports via <form> POST
+    # without needing to reach into the JSON API from JavaScript.
+    # Both redirect back to /ui/exports with ``?error=<msg>`` on
+    # validation failure so the render shows the reason inline.
+
+    @app.post("/admin/create_export")
+    def ui_admin_create_export(
+        request: Request,
+        name: str = Form(...),
+        src_url: str = Form(...),
+        _auth_check: None = Depends(require_ui_auth),
+    ) -> RedirectResponse:
+        """UI create-export: name + src_url form -> forwards through
+        the same warm-via-withcache logic ``POST /exports`` uses.
+        Pre-warmed ``{name, file}`` exports don't have a browser
+        form (operators pre-placing an image on disk are already
+        shelled in; the JSON API is the natural entry) so this
+        handler only supports the warm shape.
+
+        On success, 303 to /ui/exports so the browser flips to GET
+        and the dashboard shows the newly queued row. On any
+        validation failure, 303 to /ui/exports with an ``?error=``
+        query so the operator sees why nothing was created."""
+        del request  # accepted for FastAPI DI symmetry; unused here
+        n = (name or "").strip()
+        s = (src_url or "").strip()
+        if not n or not _valid_export_name_local(n):
+            return _redirect_with_error("name: invalid; alnum-leading, alnum/./-/_ only, max 64")
+        if not s:
+            return _redirect_with_error("src_url: non-empty string required")
+        if (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() == "":
+            return _redirect_with_error(
+                "NBDMUX_WITHCACHE_URL is not configured; the warm pipeline "
+                "needs a withcache upstream. Set the env var and restart."
+            )
+        format_hint = _detect_format(s, None)
+        dest = os.path.join(str(app.state.images_dir), f"{n}.img")
+        app.state.store.upsert_export(
+            n,
+            dest,
+            readonly=True,
+            status="queued",
+            src_url=s,
+            format=format_hint,
+        )
+        app.state.warmer.enqueue(n)
+        return RedirectResponse(url="/ui/exports", status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.post("/admin/delete_export/{name}")
+    def ui_admin_delete_export(
+        name: str,
+        request: Request,
+        _auth_check: None = Depends(require_ui_auth),
+    ) -> RedirectResponse:
+        """UI delete-export: form-encoded POST to the same underlying
+        delete-export flow the JSON DELETE /exports/{name} runs.
+        Idempotent from the operator's perspective (a repeat click
+        on a row that already vanished still lands on /ui/exports;
+        the row just isn't there).
+
+        Warm-created rows (``src_url`` set) also unlink the on-disk
+        .img the daemon owns; pre-warmed rows leave their file alone
+        because the operator placed it there. Same file-cleanup
+        branch the JSON DELETE handler uses."""
+        row = app.state.store.get_export(name)
+        existed = app.state.store.delete_export(name)
+        app.state.nbd.reload(app.state.store.list_ready_exports())
+        if existed and row and row.get("src_url"):
+            path = row.get("file") or ""
+            if path:
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    Path(path).unlink()
+        return RedirectResponse(url="/ui/exports", status_code=status.HTTP_303_SEE_OTHER)
+
+    def _redirect_with_error(msg: str) -> RedirectResponse:
+        """Build a 303 back to /ui/exports carrying ``?error=<msg>``
+        so the render context shows the reason inline. Encoded with
+        ``urllib.parse.quote`` so message text with reserved chars
+        can't break the URL shape."""
+        import urllib.parse
+
+        return RedirectResponse(
+            url="/ui/exports?error=" + urllib.parse.quote(msg, safe=""),
+            status_code=status.HTTP_303_SEE_OTHER,
         )
 
     @app.get("/ui/settings", response_class=HTMLResponse)

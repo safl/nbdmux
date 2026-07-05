@@ -16,6 +16,27 @@
                 {% endif %}
             </span>
         </span>
+        {# Create-export form pinned to the right of the subnav so
+           operators can register a new export without leaving the
+           page. Only the warm shape (name + src_url) is here; the
+           pre-warmed {name, file} shape has no natural UI because
+           the operator's already shelled in to place the file. #}
+        <span class="ms-auto d-flex align-items-center gap-2">
+            <form method="post" action="/admin/create_export"
+                  class="d-flex align-items-center gap-1 m-0">
+                <input type="text" required class="form-control form-control-sm"
+                       name="name" placeholder="export name"
+                       style="max-width: 10rem;"
+                       title="alnum-leading, alnum/./-/_ only, max 64 chars">
+                <input type="url" required class="form-control form-control-sm"
+                       name="src_url" placeholder="https://... or oras://..."
+                       style="max-width: 22rem;"
+                       title="Nbdmux fetches this URL via the configured withcache, decompresses, and stages the resulting .img at <images-dir>/<name>.img.">
+                <button type="submit" class="btn btn-sm btn-primary text-nowrap">
+                    <i class="bi bi-cloud-plus me-1"></i>Warm
+                </button>
+            </form>
+        </span>
     </div>
 </nav>
 {% endblock %}
@@ -48,6 +69,7 @@
                     <th>File</th>
                     <th>Source</th>
                     <th>Format</th>
+                    <th class="text-end" style="width: 1%; white-space: nowrap;">Action</th>
                 </tr>
             </thead>
             <tbody>
@@ -103,10 +125,25 @@
                         <span class="text-muted">-</span>
                         {% endif %}
                     </td>
+                    <td class="text-end text-nowrap">
+                        {# Delete: form-encoded POST so a simple button
+                           works without JavaScript. Warm-created rows
+                           also unlink the on-disk .img in the handler;
+                           pre-warmed rows leave their file alone. #}
+                        <form method="post" action="/admin/delete_export/{{ e.name }}"
+                              class="d-inline m-0"
+                              onsubmit="return confirm('Delete export {{ e.name }}? Warm-created rows unlink the .img from images-dir.');">
+                            <button type="submit"
+                                    class="btn btn-sm btn-outline-danger"
+                                    title="Remove this export">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </form>
+                    </td>
                 </tr>
                 {% endfor %}
                 {% if not exports %}
-                <tr><td colspan="6" class="text-muted text-center py-3">
+                <tr><td colspan="7" class="text-muted text-center py-3">
                     No exports registered yet. Operators POST to
                     <code>/exports</code> to register (see the
                     <code>nbdmux.client</code> library) or bty-web's
