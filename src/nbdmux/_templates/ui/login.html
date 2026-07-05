@@ -1,0 +1,30 @@
+{% extends "ui/_layout.html" %}
+{% block title %}Log in - nbdmux{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-body">
+                <h1 class="h4 mb-3"><i class="bi bi-shield-lock me-2"></i>Log in</h1>
+                <p class="text-muted small">
+                    Enter the admin password. Configure via
+                    <code>NBDMUX_ADMIN_PASSWORD</code> on the host.
+                </p>
+                {% if error %}
+                <div class="alert alert-danger">{{ error }}</div>
+                {% endif %}
+                <form action="/ui/login" method="post">
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Password</label>
+                        <input type="password" class="form-control" id="password"
+                               name="password" autofocus required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="bi bi-box-arrow-in-right me-1"></i>Log in
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

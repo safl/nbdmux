@@ -20,7 +20,30 @@ classifiers = [
     "Topic :: System :: Boot",
     "Topic :: System :: Filesystems",
 ]
-dependencies = []  # stdlib only, by design (delegates to the system's nbd-server)
+dependencies = [
+    # v0.3.0 shipped the FastAPI port -- the UI + JSON control plane
+    # moved off stdlib http.server. Same stack as the sibling
+    # services (bty-web, withcache) so the trio has one set of
+    # test-client + template + auth patterns. Client (nbdmux.client)
+    # stays stdlib-only so downstream consumers (bty) don't inherit
+    # the framework floor.
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    # Form-encoded POST parsing behind ``Form()`` deps.
+    "python-multipart>=0.0.9",
+    # Session cookie signing (SessionMiddleware).
+    "itsdangerous>=2.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    # FastAPI's TestClient uses httpx as its transport at runtime;
+    # not required for the daemon itself, so kept in dev only.
+    "httpx>=0.27",
+]
 
 [project.urls]
 Homepage = "https://github.com/safl/nbdmux"
