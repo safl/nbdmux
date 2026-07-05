@@ -12,11 +12,21 @@ through to a no-cache path.
     [...]
     for e in client.list_exports():
         print(e["name"], e["file"])
+
+Authentication: when the daemon runs with ``NBDMUX_ADMIN_PASSWORD``
+set (which the bty deploy always does), the write endpoints
+(``add_export``, ``warm_export``, ``remove_export``) require the
+caller to send the password as ``Authorization: Bearer <pw>``.
+Pass ``password=`` on each write call, or set
+``NBDMUX_ADMIN_PASSWORD`` in the caller's environment and the
+client picks it up automatically. Read endpoints
+(``list_exports``, ``is_healthy``) stay open and don't need it.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from typing import Any
@@ -59,6 +69,18 @@ def control_base(server: str) -> str:
     return s
 
 
+def _resolve_password(password: str | None) -> str | None:
+    """Return ``password`` if given, else fall back to
+    ``$NBDMUX_ADMIN_PASSWORD``, else ``None``. Empty / whitespace
+    values are treated as unset -- an empty Bearer token would
+    round-trip to the daemon and get rejected on the constant-time
+    compare, so short-circuit here."""
+    if password:
+        return password
+    env = (os.environ.get("NBDMUX_ADMIN_PASSWORD") or "").strip()
+    return env or None
+
+
 def _request(
     method: str,
     server: str,
@@ -66,12 +88,16 @@ def _request(
     body: dict[str, Any] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     headers: dict[str, str] | None = None,
+    password: str | None = None,
 ) -> Any:
     url = f"{control_base(server)}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if body is not None:
         req.add_header("Content-Type", "application/json")
+    resolved_pw = _resolve_password(password)
+    if resolved_pw is not None:
+        req.add_header("Authorization", f"Bearer {resolved_pw}")
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
@@ -105,6 +131,7 @@ def add_export(
     readonly: bool = True,
     server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
+    password: str | None = None,
 ) -> dict[str, Any]:
     """Register a pre-warmed file as a named NBD export.
 
@@ -124,6 +151,7 @@ def add_export(
         "/exports",
         body={"name": name, "file": file, "readonly": readonly},
         timeout=timeout,
+        password=password,
     )
 
 
@@ -135,6 +163,7 @@ def warm_export(
     readonly: bool = True,
     server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
+    password: str | None = None,
 ) -> dict[str, Any]:
     """Enqueue a warm: nbdmux fetches ``src_url`` via the configured
     withcache, decompresses on the fly, and lands the raw .img under
@@ -154,7 +183,7 @@ def warm_export(
     body: dict[str, Any] = {"name": name, "src_url": src_url, "readonly": readonly}
     if format_hint is not None:
         body["format"] = format_hint
-    return _request("POST", server, "/exports", body=body, timeout=timeout)
+    return _request("POST", server, "/exports", body=body, timeout=timeout, password=password)
 
 
 def list_exports(
@@ -172,6 +201,7 @@ def remove_export(
     name: str,
     server: str = "http://localhost:8082",
     timeout: float = DEFAULT_TIMEOUT,
+    password: str | None = None,
 ) -> None:
     """Unregister an export by name. 404 (no such export) is treated
     as success so the call is idempotent for the operator's "make sure
@@ -180,7 +210,7 @@ def remove_export(
     Raises :class:`NbdmuxError` on transport failure but NOT on 404.
     """
     try:
-        _request("DELETE", server, f"/exports/{name}", timeout=timeout)
+        _request("DELETE", server, f"/exports/{name}", timeout=timeout, password=password)
     except NbdmuxError as exc:
         if "HTTP 404" in str(exc):
             return

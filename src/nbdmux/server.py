@@ -138,6 +138,19 @@ class Auth:
             return False  # auth disabled = no password check passes
         return hmac.compare_digest(pw.encode("utf-8"), self.password.encode("utf-8"))
 
+    def check_bearer(self, token: str) -> bool:
+        """Constant-time compare a raw Bearer token against the
+        configured admin password. Used by the JSON control-plane's
+        service-to-service path (bty-web reads
+        ``$NBDMUX_ADMIN_PASSWORD`` and sends it as
+        ``Authorization: Bearer <pw>``). Equivalent trust surface
+        to ``check_password`` -- both are password comparisons --
+        so callers can pick whichever channel their transport
+        supports."""
+        if not self.password:
+            return False
+        return hmac.compare_digest(token.encode("utf-8"), self.password.encode("utf-8"))
+
 
 # --------------------------------------------------------------------------
 # Store -- SQLite-backed exports table
