@@ -1,27 +1,23 @@
 """FastAPI app factory for nbdmux (v0.3.0 port).
 
 Replaces the stdlib ``http.server``-based ``server.py`` request
-handler with a FastAPI application. The port is intentionally
-staged: this module currently hosts only the scaffolding (Jinja +
-static + session middleware + healthz + login) so a TestClient-
-backed test can prove the pattern works. The JSON control-plane
-endpoints (``/exports`` verbs), the operator Exports page, the
-Warmer thread lifespan wiring, and the new Settings page migrate
-in follow-up commits.
-
-The stdlib ``server.py`` remains the runtime daemon during the
-port; ``main()`` there is unchanged. That keeps the existing 100
-tests green while this file lands and gets iterated.
-
-Layout mirrors ``bty.web._app``: :func:`create_app` returns a
+handler with a FastAPI application. :func:`create_app` returns a
 FastAPI instance the caller mounts under whatever ASGI server it
-picks (uvicorn for production, TestClient for tests).
+picks -- uvicorn for the daemon (``server.main`` boots it via
+:mod:`uvicorn`) and TestClient for tests.
+
+Layout mirrors ``bty.web._app``. A ``lifespan`` hook starts the
+Warmer thread + nbd-server subprocess on daemon startup and stops
+them on shutdown; it fires only when ``run_lifecycle=True`` is
+passed, so TestClient callers don't spawn threads or subprocesses.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Callable
+import sys
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +91,8 @@ def create_app(
     warmer: Any | None = None,
     nbd: Any | None = None,
     images_dir: str | os.PathLike[str] | None = None,
+    nbd_port: int = 10809,
+    run_lifecycle: bool = False,
 ) -> FastAPI:
     """Build the FastAPI application for the nbdmux control plane.
 
@@ -115,6 +113,40 @@ def create_app(
     auth = Auth(secret=secret, password=admin_password)
 
     jinja = _build_jinja(_TEMPLATES_DIR)
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Start/stop the Warmer thread + nbd-server subprocess.
+
+        Fires only when ``run_lifecycle=True`` (the daemon path via
+        :func:`server.main`). TestClient callers omit the flag so
+        the fixture doesn't spawn threads or launch nbd-server.
+        Resume-pending re-enqueues any rows the Warmer was
+        mid-processing at the last shutdown so an operator restart
+        picks up where the previous run left off."""
+        if run_lifecycle:
+            _app.state.nbd.start(_app.state.store.list_ready_exports())
+            _app.state.warmer.start()
+            # Resume rows that were mid-warm at the last shutdown; the
+            # Warmer walks each through fetch -> decompress -> ready
+            # in the same order the pre-port stdlib server did.
+            for row in _app.state.store.list_pending_exports():
+                _app.state.warmer.enqueue(row["name"])
+            print(
+                f"nbdmux: NBD tcp://:{_app.state.nbd_port}/ "
+                f"data={_app.state.data_dir} "
+                f"images={_app.state.images_dir}",
+                file=sys.stderr,
+                flush=True,
+            )
+        try:
+            yield
+        finally:
+            if run_lifecycle:
+                _app.state.warmer.stop()
+                _app.state.nbd.stop()
+                print("nbdmux: shut down", file=sys.stderr, flush=True)
+
     app = FastAPI(
         title="nbdmux",
         version=__version__,
@@ -124,6 +156,7 @@ def create_app(
         # dev if needed.
         docs_url=None,
         redoc_url=None,
+        lifespan=_lifespan,
     )
 
     # SessionMiddleware signs a cookie so tests + the UI can share
@@ -153,6 +186,8 @@ def create_app(
     app.state.images_dir = (
         str(images_dir) if images_dir is not None else str(Path(data_dir_str) / "images")
     )
+    app.state.data_dir = data_dir_str
+    app.state.nbd_port = nbd_port
     Path(app.state.images_dir).mkdir(parents=True, exist_ok=True)
 
     register_api_routes(app, auth=auth, session_authed_key=SESSION_AUTHED_KEY)
@@ -275,11 +310,11 @@ def create_app(
             data_dir=data_dir_str,
             images_dir=str(app.state.images_dir),
             withcache_url=withcache_url,
-            # nbd-server default port; the CLI accepts --nbd-port but
-            # this page only shows the effective value. When the runtime
-            # migrates and takes the CLI-arg pipe through the app
-            # constructor, this reads from that instead of the literal.
-            nbd_port=10809,
+            # nbd-server port threaded through from ``create_app``
+            # (default 10809; CLI ``--nbd-port`` on ``server.main``
+            # overrides). Reads from app.state so a rolling redeploy
+            # sees the new value on the next render.
+            nbd_port=app.state.nbd_port,
             auth_enabled=auth.enabled,
             session_secret_from_env=session_secret_from_env,
         )

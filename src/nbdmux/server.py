@@ -1691,6 +1691,20 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main() -> int:
+    """Daemon entry point.
+
+    v0.3.0 (this port): FastAPI + uvicorn. The stdlib http.server
+    ``_ThreadingHTTPServer`` + Handler stay in this module as an
+    escape hatch for the pre-port unit tests that spin their own
+    fixture, but the runtime daemon uses ``uvicorn.run`` against
+    :func:`nbdmux._app.create_app`. Warmer + NbdServer lifecycle
+    (start / stop / resume-pending) moves to the FastAPI lifespan
+    hook; SIGTERM / SIGINT handling is uvicorn's.
+    """
+    import uvicorn
+
+    from ._app import create_app
+
     summary = (__doc__ or "nbdmux daemon").splitlines()[0]
     p = argparse.ArgumentParser(prog="nbdmux-server", description=summary)
     # ``--data-dir`` falls back to ``$NBDMUX_DATA_DIR`` so the
@@ -1719,7 +1733,6 @@ def main() -> int:
     images_dir = os.path.abspath(args.images_dir or os.path.join(data_dir, "images"))
     os.makedirs(images_dir, exist_ok=True)
 
-    secret = resolve_secret(data_dir)
     password = (os.environ.get("NBDMUX_ADMIN_PASSWORD") or "").strip() or None
     if password is None:
         print(
@@ -1737,39 +1750,27 @@ def main() -> int:
             flush=True,
         )
 
+    # Instantiate the real Store + Warmer + NbdServer before create_app
+    # so the FastAPI app.state carries the same instances the
+    # lifespan hook will start / stop. ``_ensure_probe_export`` runs
+    # here (not in the lifespan) so a fresh state.db has the probe
+    # row before nbd-server first reads the ready list.
     store = Store(data_dir)
-    auth = Auth(secret, password)
+    _ensure_probe_export(store, data_dir)
     nbd = NbdServer(
         data_dir=data_dir, port=args.nbd_port, bind=args.bind, nbd_server_bin=args.nbd_server_bin
     )
-    _ensure_probe_export(store, data_dir)
-    # nbd-server only sees ``ready`` exports; in-flight + failed
-    # rows stay invisible to NBD clients but visible to the dashboard
-    # + the JSON API.
-    nbd.start(store.list_ready_exports())
-
     warmer = Warmer(store=store, nbd=nbd, images_dir=images_dir)
-    warmer.start()
-    # Resume any rows that were mid-warm at the last shutdown.
-    for row in store.list_pending_exports():
-        warmer.enqueue(row["name"])
 
-    httpd = _ThreadingHTTPServer((args.bind, args.port), Handler)
-    httpd.store = store  # type: ignore[attr-defined]
-    httpd.auth = auth  # type: ignore[attr-defined]
-    httpd.nbd = nbd  # type: ignore[attr-defined]
-    httpd.nbd_port = args.nbd_port  # type: ignore[attr-defined]
-    httpd.warmer = warmer  # type: ignore[attr-defined]
-    httpd.images_dir = images_dir  # type: ignore[attr-defined]
-
-    def _shutdown(_signum, _frame):
-        print("nbdmux: shutting down", file=sys.stderr, flush=True)
-        warmer.stop()
-        nbd.stop()
-        httpd.shutdown()
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
+    app = create_app(
+        data_dir=data_dir,
+        store=store,
+        warmer=warmer,
+        nbd=nbd,
+        images_dir=images_dir,
+        nbd_port=args.nbd_port,
+        run_lifecycle=True,
+    )
 
     print(
         f"nbdmux: HTTP http://{args.bind}:{args.port}/ "
@@ -1778,11 +1779,7 @@ def main() -> int:
         file=sys.stderr,
         flush=True,
     )
-    try:
-        httpd.serve_forever()
-    finally:
-        warmer.stop()
-        nbd.stop()
+    uvicorn.run(app, host=args.bind, port=args.port, log_level="info")
     return 0
 
 
