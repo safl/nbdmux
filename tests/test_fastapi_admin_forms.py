@@ -166,9 +166,7 @@ class DeleteExportFormTests(_AdminFormsBase):
             data={"src_url": "https://upstream.invalid/to-delete.img.gz"},
         )
         self.assertEqual(len(self.client.get("/exports").json()), 1)
-        r = self.client.post(
-            "/admin/delete_export/to-delete.img.gz", follow_redirects=False
-        )
+        r = self.client.post("/admin/delete_export/to-delete.img.gz", follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertEqual(r.headers["location"], "/ui/exports")
         self.assertEqual(self.client.get("/exports").json(), [])
@@ -240,15 +238,26 @@ class CatalogPickerRenderTests(_AdminFormsBase):
 
         _urlreq.urlopen = self._orig_urlopen  # type: ignore[assignment]
 
-    def test_picker_lists_catalog_entries(self) -> None:
+    def test_picker_lists_downloaded_catalog_entries(self) -> None:
+        """Only entries with a ``downloaded_at`` set land in the
+        picker. Since withcache retired auto-fetch on cache miss,
+        an export against an undownloaded entry would just fail at
+        fetch time; the picker refuses to offer it up front so the
+        operator sees exactly what's ready to export."""
         self._patch_catalog(
             [
                 {
                     "name": "ubuntu-24.04",
                     "src": "https://upstream.invalid/ubuntu-24.04.img.gz",
                     "format": "img.gz",
+                    "downloaded_at": "2026-07-06T12:00:00Z",
                 },
-                {"name": "no-src-drops"},  # dropped by the filter
+                {  # dropped: no downloaded_at
+                    "name": "not-yet",
+                    "src": "https://upstream.invalid/not-yet.img.gz",
+                    "downloaded_at": None,
+                },
+                {"name": "no-src-drops"},  # dropped: no src
             ]
         )
         try:
@@ -258,16 +267,30 @@ class CatalogPickerRenderTests(_AdminFormsBase):
         self.assertIn('name="src_url"', body)
         self.assertIn("https://upstream.invalid/ubuntu-24.04.img.gz", body)
         self.assertIn("ubuntu-24.04", body)
+        # Not-yet-downloaded entries never surface in the picker.
+        self.assertNotIn("not-yet.img.gz", body)
         # And the URL text input is gone.
         self.assertNotIn('type="url"', body)
 
-    def test_picker_shows_empty_hint_when_catalog_is_empty(self) -> None:
-        self._patch_catalog([])
+    def test_picker_shows_empty_hint_when_no_downloaded_entries(self) -> None:
+        # A catalog full of undownloaded entries is functionally
+        # empty from nbdmux's point of view. Same empty-state copy
+        # as an actually-empty catalog so the operator sees the
+        # right next step: hit Download on withcache's /ui/catalog.
+        self._patch_catalog(
+            [
+                {
+                    "name": "not-yet",
+                    "src": "https://upstream.invalid/x.img.gz",
+                    "downloaded_at": None,
+                }
+            ]
+        )
         try:
             body = self.client.get("/ui/exports").text
         finally:
             self._restore_catalog()
-        self.assertIn("withcache catalog is empty", body)
+        self.assertIn("No downloaded catalog entries", body)
 
     def test_picker_shows_unreachable_hint_on_transport_error(self) -> None:
         import urllib.error as _urlerr

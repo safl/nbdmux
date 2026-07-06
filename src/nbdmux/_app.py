@@ -75,9 +75,20 @@ def _fetch_withcache_catalog(
     entries = payload.get("entries") if isinstance(payload, dict) else None
     if not isinstance(entries, list):
         return [], f"catalog at {endpoint} returned a non-list ``entries`` field"
-    # Filter to entries with a usable ``src`` so the template
-    # doesn't have to defensively check every row.
-    return [e for e in entries if isinstance(e, dict) and isinstance(e.get("src"), str)], None
+    # Filter to entries that both (a) carry a usable ``src`` and
+    # (b) have been downloaded on the withcache side. Since
+    # withcache v0.10.0 there is no auto-fetch on cache miss: an
+    # export against an undownloaded entry would just fail at fetch
+    # time with a 404, so the picker refuses to offer such entries
+    # up front. Operators visiting withcache's /ui/catalog and
+    # hitting Download flip the entry into the picker.
+    return [
+        e
+        for e in entries
+        if isinstance(e, dict)
+        and isinstance(e.get("src"), str)
+        and e.get("downloaded_at") is not None
+    ], None
 
 
 def _build_jinja(templates_dir: Path) -> Environment:
