@@ -128,7 +128,7 @@ class ExportsPageTests(_UiPagesBase):
 
     def test_subnav_shows_withcache_url_when_configured(self) -> None:
         body = self.client.get("/ui/exports").text
-        self.assertIn("warms via", body)
+        self.assertIn("exports from", body)
         self.assertIn("withcache.invalid", body)
 
 
