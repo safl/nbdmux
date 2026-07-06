@@ -56,11 +56,53 @@ from . import __version__
 #     the images dir and ``.`` prefix makes it dotfile-hidden.
 # Constrain to alnum-leading + alnum/dot/dash/underscore, max 64
 # chars, matching bty's label validator (bty/web/_models.py):
+_EXPORT_NAME_MAX = 64
 _EXPORT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_EXPORT_NAME_INVALID_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _valid_export_name(name: str) -> bool:
     return bool(_EXPORT_NAME_RE.match(name))
+
+
+def _derive_export_name(src_url: str) -> str | None:
+    """Derive an export name from ``src_url``'s basename.
+
+    Returns ``None`` when nothing usable falls out (e.g. a bare
+    ``https://example.com`` with no path segment). The caller
+    surfaces that as a 400 so the operator sees why nothing was
+    created rather than a mystery ``xxx.img`` on disk.
+
+    Sanitisation: any character not on the export-name allowlist
+    is folded to ``-``; leading non-alnum characters are stripped;
+    the result is truncated to 64 chars. Both ``.gz`` /``.zst`` /
+    ``.img`` suffixes are kept intact -- an operator glancing at
+    an export list benefits from the format hint the extension
+    carries.
+
+    Examples:
+      https://ex/foo.img.gz               -> foo.img.gz
+      https://ex/path/Ubuntu%2024.iso.zst -> Ubuntu-24.iso.zst
+      oras://ghcr.io/owner/repo:tag       -> repo-tag
+    """
+    from pathlib import PurePosixPath
+    from urllib.parse import unquote, urlsplit
+
+    parsed = urlsplit((src_url or "").strip())
+    # PurePosixPath handles ``//`` gracefully and gives us the last
+    # slash-delimited component. Unquote for %20 etc.; oras://
+    # tags land in ``path`` (no query/fragment).
+    basename = PurePosixPath(unquote(parsed.path)).name
+    if not basename:
+        return None
+    # Fold everything outside the allowlist to '-'. Then peel
+    # leading non-alnum until we hit a valid first char, and cap
+    # length so we don't slide past the INI-section-safe cap.
+    sanitised = _EXPORT_NAME_INVALID_CHARS.sub("-", basename).strip("-")
+    while sanitised and not sanitised[0].isalnum():
+        sanitised = sanitised[1:]
+    sanitised = sanitised[:_EXPORT_NAME_MAX]
+    return sanitised or None
 
 
 USER_AGENT = f"nbdmux/{__version__}"

@@ -29,8 +29,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from . import __version__, _settings_store
 from ._api import register_api_routes
-from .server import Auth, Store, _detect_format, resolve_secret
-from .server import _valid_export_name as _valid_export_name_local
+from .server import Auth, Store, _derive_export_name, _detect_format, resolve_secret
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _TEMPLATES_DIR = Path(__file__).parent / "_templates"
@@ -46,6 +45,39 @@ class NotAuthenticated(Exception):
     """Raised by :func:`require_ui_auth` when the request lacks an
     authed session. The exception handler redirects to ``/ui/login``.
     """
+
+
+def _fetch_withcache_catalog(
+    withcache_url: str | None,
+    *,
+    timeout: float = 3.0,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch ``<withcache_url>/catalog`` and return ``(entries, error)``.
+
+    Stdlib-only (mirroring the rest of nbdmux: no ``withcache``
+    library dep). Returns ``([], "...")`` on transport / HTTP / JSON
+    failure so /ui/exports renders with an empty picker and an
+    inline hint rather than a 500. ``([], None)`` when withcache
+    isn't configured -- the caller decides which alert to render.
+    """
+    if not withcache_url:
+        return [], None
+    import json as _json
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    endpoint = withcache_url.rstrip("/") + "/catalog"
+    try:
+        with _urlreq.urlopen(endpoint, timeout=timeout) as resp:  # noqa: S310
+            payload = _json.loads(resp.read().decode("utf-8"))
+    except (_urlerr.URLError, TimeoutError, ValueError, OSError) as exc:
+        return [], f"could not fetch catalog from {endpoint}: {exc}"
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return [], f"catalog at {endpoint} returned a non-list ``entries`` field"
+    # Filter to entries with a usable ``src`` so the template
+    # doesn't have to defensively check every row.
+    return [e for e in entries if isinstance(e, dict) and isinstance(e.get("src"), str)], None
 
 
 def _build_jinja(templates_dir: Path) -> Environment:
@@ -280,19 +312,24 @@ def create_app(
     ) -> HTMLResponse:
         """The operator dashboard: one row per registered export
         with status pill + progress bar. Reads ``app.state.store``
-        (same instance the JSON API mutates) and the withcache
-        URL for the subnav's "warms via ..." indicator. The
-        ``?error=`` query param carries the flash from a failed
-        admin-form submission back into the render context so the
-        redirect target shows the reason inline."""
+        (same instance the JSON API mutates), the withcache URL
+        for the subnav's "warms via ..." indicator, and the
+        withcache catalog so the create-export picker can offer
+        the operator-curated inventory instead of a manual URL
+        field. The ``?error=`` query param carries the flash from
+        a failed admin-form submission back into the render
+        context so the redirect target shows the reason inline."""
         exports = app.state.store.list_exports()
         withcache_url = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None
+        catalog_entries, catalog_error = _fetch_withcache_catalog(withcache_url)
         return render(
             "ui/exports.html",
             request,
             nav_active="exports",
             exports=exports,
             withcache_url=withcache_url,
+            catalog_entries=catalog_entries,
+            catalog_error=catalog_error,
             flash=error,
             flash_kind="danger" if error else None,
         )
@@ -308,28 +345,35 @@ def create_app(
     @app.post("/admin/create_export")
     def ui_admin_create_export(
         request: Request,
-        name: str = Form(...),
         src_url: str = Form(...),
         _auth_check: None = Depends(require_ui_auth),
     ) -> RedirectResponse:
-        """UI create-export: name + src_url form -> forwards through
-        the same warm-via-withcache logic ``POST /exports`` uses.
-        Pre-warmed ``{name, file}`` exports don't have a browser
-        form (operators pre-placing an image on disk are already
-        shelled in; the JSON API is the natural entry) so this
-        handler only supports the warm shape.
+        """UI create-export: src_url form -> forwards through the
+        same warm-via-withcache logic ``POST /exports`` uses. The
+        export name is derived from the URL's basename (sanitised
+        to the export-name allowlist) so operators don't have to
+        pick one by hand and the row that appears in /ui/exports
+        matches the filename they recognise. Pre-warmed
+        ``{name, file}`` exports don't have a browser form
+        (operators pre-placing an image on disk are already shelled
+        in; the JSON API is the natural entry) so this handler only
+        supports the warm shape.
 
         On success, 303 to /ui/exports so the browser flips to GET
         and the dashboard shows the newly queued row. On any
         validation failure, 303 to /ui/exports with an ``?error=``
         query so the operator sees why nothing was created."""
         del request  # accepted for FastAPI DI symmetry; unused here
-        n = (name or "").strip()
         s = (src_url or "").strip()
-        if not n or not _valid_export_name_local(n):
-            return _redirect_with_error("name: invalid; alnum-leading, alnum/./-/_ only, max 64")
         if not s:
             return _redirect_with_error("src_url: non-empty string required")
+        n = _derive_export_name(s)
+        if not n:
+            return _redirect_with_error(
+                f"src_url {s!r}: could not derive an export name from the "
+                "URL's basename (empty path? bare host?). "
+                "Add a trailing filename or POST /exports with an explicit name."
+            )
         if (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() == "":
             return _redirect_with_error(
                 "NBDMUX_WITHCACHE_URL is not configured; the warm pipeline "

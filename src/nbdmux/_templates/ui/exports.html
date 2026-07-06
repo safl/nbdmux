@@ -18,24 +18,45 @@
         </span>
         {# Create-export form pinned to the right of the subnav so
            operators can register a new export without leaving the
-           page. Only the warm shape (name + src_url) is here; the
-           pre-warmed {name, file} shape has no natural UI because
-           the operator's already shelled in to place the file. #}
+           page. The picker options come from withcache's catalog
+           (`GET /catalog`); the export name is derived from the
+           entry's URL basename. Pre-warmed {name, file} exports
+           have no browser form because the operator's already
+           shelled in to place the file. #}
         <span class="ms-auto d-flex align-items-center gap-2">
+            {% if catalog_entries %}
             <form method="post" action="/admin/create_export"
                   class="d-flex align-items-center gap-1 m-0">
-                <input type="text" required class="form-control form-control-sm"
-                       name="name" placeholder="export name"
-                       style="max-width: 10rem;"
-                       title="alnum-leading, alnum/./-/_ only, max 64 chars">
-                <input type="url" required class="form-control form-control-sm"
-                       name="src_url" placeholder="https://... or oras://..."
-                       style="max-width: 22rem;"
-                       title="Nbdmux fetches this URL via the configured withcache, decompresses, and stages the resulting .img at <images-dir>/<name>.img.">
+                <label class="form-label small mb-0 me-1 text-nowrap" for="create-export-catalog">
+                    Warm from catalog:
+                </label>
+                <select required class="form-select form-select-sm"
+                        id="create-export-catalog" name="src_url"
+                        style="max-width: 32rem;"
+                        title="Pick a catalog entry from withcache. Nbdmux derives the export name from the URL basename, fetches via withcache, decompresses, and stages the resulting .img at <images-dir>/<name>.img.">
+                    {% for e in catalog_entries %}
+                    <option value="{{ e.src }}">
+                        {{ e.name or e.src }}{% if e.format %} ({{ e.format }}){% endif %}
+                    </option>
+                    {% endfor %}
+                </select>
                 <button type="submit" class="btn btn-sm btn-primary text-nowrap">
                     <i class="bi bi-cloud-plus me-1"></i>Warm
                 </button>
             </form>
+            {% elif not withcache_url %}
+            <span class="text-warning small">
+                <i class="bi bi-exclamation-triangle me-1"></i>Set NBDMUX_WITHCACHE_URL to pick images from withcache.
+            </span>
+            {% elif catalog_error %}
+            <span class="text-danger small" title="{{ catalog_error }}">
+                <i class="bi bi-x-octagon me-1"></i>catalog unreachable
+            </span>
+            {% else %}
+            <span class="text-muted small">
+                <i class="bi bi-inbox me-1"></i>withcache catalog is empty; add an entry there first.
+            </span>
+            {% endif %}
         </span>
     </div>
 </nav>

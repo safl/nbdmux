@@ -67,28 +67,41 @@ class _AdminFormsBase(unittest.TestCase):
 
 
 class CreateExportFormHappyPathTests(_AdminFormsBase):
-    """Form-encoded name + src_url -> row lands as queued and the
-    browser 303s to /ui/exports so the dashboard reflects it."""
+    """Form-encoded src_url -> row lands as queued and the browser
+    303s to /ui/exports so the dashboard reflects it. The export
+    name is derived from the URL's basename (sanitised) so the
+    operator doesn't have to pick one by hand."""
 
     def test_valid_form_creates_queued_row_and_redirects(self) -> None:
         r = self.client.post(
             "/admin/create_export",
-            data={
-                "name": "demo",
-                "src_url": "https://upstream.invalid/demo.img.gz",
-            },
+            data={"src_url": "https://upstream.invalid/demo.img.gz"},
             follow_redirects=False,
         )
         self.assertEqual(r.status_code, 303)
         self.assertEqual(r.headers["location"], "/ui/exports")
         # Row visible via the JSON API + on the Jinja-rendered page.
+        # Name matches the URL's basename verbatim (already valid).
         listing = self.client.get("/exports").json()
         self.assertEqual(len(listing), 1)
-        self.assertEqual(listing[0]["name"], "demo")
+        self.assertEqual(listing[0]["name"], "demo.img.gz")
         self.assertEqual(listing[0]["status"], "queued")
         self.assertEqual(listing[0]["src_url"], "https://upstream.invalid/demo.img.gz")
         body = self.client.get("/ui/exports").text
-        self.assertIn("demo", body)
+        self.assertIn("demo.img.gz", body)
+
+    def test_url_with_non_allowlist_chars_is_sanitised(self) -> None:
+        """Any character outside ``[A-Za-z0-9._-]`` folds to ``-`` so
+        the derived name is INI-section-safe. Percent-encoded chars
+        get decoded first so ``%20`` becomes ``-`` not ``-20-``."""
+        r = self.client.post(
+            "/admin/create_export",
+            data={"src_url": "https://upstream.invalid/path/Ubuntu%2024.iso.zst"},
+            follow_redirects=False,
+        )
+        self.assertEqual(r.status_code, 303)
+        listing = self.client.get("/exports").json()
+        self.assertEqual(listing[0]["name"], "Ubuntu-24.iso.zst")
 
 
 class CreateExportFormValidationTests(_AdminFormsBase):
@@ -96,48 +109,34 @@ class CreateExportFormValidationTests(_AdminFormsBase):
     ``?error=<msg>`` query so the render shows the reason inline
     -- no 400 / 500 stack traces bleeding to the operator."""
 
-    def test_empty_name_redirects_with_error(self) -> None:
+    def test_empty_src_url_redirects_with_error(self) -> None:
         r = self.client.post(
             "/admin/create_export",
-            data={"name": "  ", "src_url": "https://upstream.invalid/demo"},
+            data={"src_url": "   "},
             follow_redirects=False,
         )
         self.assertEqual(r.status_code, 303)
         self.assertTrue(r.headers["location"].startswith("/ui/exports?error="))
-        self.assertIn("name", r.headers["location"])
+        self.assertIn("src_url", r.headers["location"])
 
-    def test_bad_name_shape_redirects_with_error(self) -> None:
-        """Names get injected as ``[<name>]`` in nbd-server.conf;
-        reject anything with slashes / spaces / brackets so the
-        INI stays parseable."""
-        for bad in ("has space", "has/slash", "]bracket", "-leading-dash"):
-            with self.subTest(name=bad):
+    def test_url_without_basename_redirects_with_error(self) -> None:
+        """A bare host without a path segment gives us nothing to
+        derive from; refuse rather than mint a mystery ``xxx.img``."""
+        for bad in ("https://upstream.invalid", "https://upstream.invalid/"):
+            with self.subTest(url=bad):
                 r = self.client.post(
                     "/admin/create_export",
-                    data={"name": bad, "src_url": "https://upstream.invalid/demo"},
+                    data={"src_url": bad},
                     follow_redirects=False,
                 )
                 self.assertEqual(r.status_code, 303)
                 self.assertIn("error=", r.headers["location"])
 
-    def test_missing_src_url_redirects_with_error(self) -> None:
-        # FastAPI's Form(...) requires the field; a missing field
-        # 422s at the framework layer rather than reaching our
-        # handler. Test the "empty after strip" branch instead --
-        # a blank submission the operator would actually make.
-        r = self.client.post(
-            "/admin/create_export",
-            data={"name": "demo", "src_url": "   "},
-            follow_redirects=False,
-        )
-        self.assertEqual(r.status_code, 303)
-        self.assertIn("src_url", r.headers["location"])
-
     def test_missing_withcache_url_redirects_with_error(self) -> None:
         os.environ.pop("NBDMUX_WITHCACHE_URL", None)
         r = self.client.post(
             "/admin/create_export",
-            data={"name": "demo", "src_url": "https://upstream.invalid/demo"},
+            data={"src_url": "https://upstream.invalid/demo.img.gz"},
             follow_redirects=False,
         )
         self.assertEqual(r.status_code, 303)
@@ -149,27 +148,27 @@ class CreateExportFormValidationTests(_AdminFormsBase):
         nothing was created without opening dev tools."""
         r = self.client.post(
             "/admin/create_export",
-            data={"name": "]bad", "src_url": "https://upstream.invalid/demo"},
+            data={"src_url": "https://upstream.invalid"},
             follow_redirects=True,
         )
         self.assertEqual(r.status_code, 200)
         # ``flash`` context var renders as a Bootstrap alert.
         self.assertIn("alert-danger", r.text)
-        self.assertIn("name", r.text.lower())
+        self.assertIn("basename", r.text.lower())
 
 
 class DeleteExportFormTests(_AdminFormsBase):
     def test_delete_removes_row_and_redirects(self) -> None:
-        # Seed with a form-created row.
+        # Seed with a form-created row; the derived export name
+        # matches the URL basename.
         self.client.post(
             "/admin/create_export",
-            data={
-                "name": "to-delete",
-                "src_url": "https://upstream.invalid/x.img.gz",
-            },
+            data={"src_url": "https://upstream.invalid/to-delete.img.gz"},
         )
         self.assertEqual(len(self.client.get("/exports").json()), 1)
-        r = self.client.post("/admin/delete_export/to-delete", follow_redirects=False)
+        r = self.client.post(
+            "/admin/delete_export/to-delete.img.gz", follow_redirects=False
+        )
         self.assertEqual(r.status_code, 303)
         self.assertEqual(r.headers["location"], "/ui/exports")
         self.assertEqual(self.client.get("/exports").json(), [])
@@ -192,7 +191,7 @@ class AuthGatedTests(_AdminFormsBase):
         to /ui/login (same shape as any other /ui/* route)."""
         r = self.client.post(
             "/admin/create_export",
-            data={"name": "demo", "src_url": "https://upstream.invalid/demo"},
+            data={"src_url": "https://upstream.invalid/demo.img.gz"},
             follow_redirects=False,
         )
         self.assertEqual(r.status_code, 303)
@@ -207,11 +206,93 @@ class AuthGatedTests(_AdminFormsBase):
         self._login()
         r = self.client.post(
             "/admin/create_export",
-            data={"name": "demo", "src_url": "https://upstream.invalid/demo"},
+            data={"src_url": "https://upstream.invalid/demo.img.gz"},
             follow_redirects=False,
         )
         self.assertEqual(r.status_code, 303)
         self.assertEqual(r.headers["location"], "/ui/exports")
+
+
+class CatalogPickerRenderTests(_AdminFormsBase):
+    """The /ui/exports subnav offers a catalog picker populated
+    from ``<NBDMUX_WITHCACHE_URL>/catalog``. On success the
+    template renders a ``<select>`` with an ``<option>`` per
+    entry; on failure the subnav shows an inline error. Both are
+    render-time only -- the catalog fetcher is a stdlib
+    ``urllib.request.urlopen`` call, so the test monkeypatches at
+    that boundary."""
+
+    def _patch_catalog(self, entries: list[dict[str, object]]) -> None:
+        import io
+        import json as _json
+        import urllib.request as _urlreq
+
+        payload = _json.dumps({"entries": entries}).encode("utf-8")
+
+        def _fake_urlopen(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return io.BytesIO(payload)
+
+        self._orig_urlopen = _urlreq.urlopen
+        _urlreq.urlopen = _fake_urlopen  # type: ignore[assignment]
+
+    def _restore_catalog(self) -> None:
+        import urllib.request as _urlreq
+
+        _urlreq.urlopen = self._orig_urlopen  # type: ignore[assignment]
+
+    def test_picker_lists_catalog_entries(self) -> None:
+        self._patch_catalog(
+            [
+                {
+                    "name": "ubuntu-24.04",
+                    "src": "https://upstream.invalid/ubuntu-24.04.img.gz",
+                    "format": "img.gz",
+                },
+                {"name": "no-src-drops"},  # dropped by the filter
+            ]
+        )
+        try:
+            body = self.client.get("/ui/exports").text
+        finally:
+            self._restore_catalog()
+        self.assertIn('name="src_url"', body)
+        self.assertIn("https://upstream.invalid/ubuntu-24.04.img.gz", body)
+        self.assertIn("ubuntu-24.04", body)
+        # And the URL text input is gone.
+        self.assertNotIn('type="url"', body)
+
+    def test_picker_shows_empty_hint_when_catalog_is_empty(self) -> None:
+        self._patch_catalog([])
+        try:
+            body = self.client.get("/ui/exports").text
+        finally:
+            self._restore_catalog()
+        self.assertIn("withcache catalog is empty", body)
+
+    def test_picker_shows_unreachable_hint_on_transport_error(self) -> None:
+        import urllib.error as _urlerr
+        import urllib.request as _urlreq
+
+        def _boom(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise _urlerr.URLError("connection refused")
+
+        orig = _urlreq.urlopen
+        _urlreq.urlopen = _boom  # type: ignore[assignment]
+        try:
+            body = self.client.get("/ui/exports").text
+        finally:
+            _urlreq.urlopen = orig  # type: ignore[assignment]
+        self.assertIn("catalog unreachable", body)
+
+
+class CatalogPickerWithoutWithcacheTests(_AdminFormsBase):
+    WITHCACHE_URL = None
+
+    def test_picker_shows_configure_hint(self) -> None:
+        body = self.client.get("/ui/exports").text
+        self.assertIn("NBDMUX_WITHCACHE_URL", body)
+        # No src_url field at all when unconfigured.
+        self.assertNotIn('name="src_url"', body)
 
 
 if __name__ == "__main__":  # pragma: no cover
