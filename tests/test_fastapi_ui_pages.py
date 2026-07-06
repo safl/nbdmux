@@ -126,21 +126,24 @@ class ExportsPageTests(_UiPagesBase):
         self.assertIn("queued", body)
         self.assertIn("https://upstream.invalid/demo.img.gz", body)
 
-    def test_subnav_shows_withcache_url_when_configured(self) -> None:
+    def test_page_shows_withcache_url_when_configured(self) -> None:
+        # Since v0.5.1 the subnav only carries jumps + the picker form;
+        # withcache URL context moved into the intro-box area (visible
+        # on empty-catalog / unreachable / no-withcache states).
         body = self.client.get("/ui/exports").text
-        self.assertIn("exports from", body)
         self.assertIn("withcache.invalid", body)
 
 
 class ExportsPageNoWithcacheTests(_UiPagesBase):
-    """When NBDMUX_WITHCACHE_URL is unset, the subnav flips to a
-    warning so operators immediately spot the misconfiguration."""
+    """When NBDMUX_WITHCACHE_URL is unset, an alert in the intro-box
+    area flags the misconfiguration."""
 
     WITHCACHE_URL = None
 
     def test_warns_when_withcache_url_missing(self) -> None:
         body = self.client.get("/ui/exports").text
-        self.assertIn("no NBDMUX_WITHCACHE_URL configured", body)
+        self.assertIn("NBDMUX_WITHCACHE_URL", body)
+        self.assertIn("not set", body)
 
 
 class SettingsPageTests(_UiPagesBase):

@@ -4,83 +4,76 @@
 {% block subnav %}
 <nav class="navbar subnav-strip" aria-label="Section sub-navigation">
     <div class="container">
-        <span class="d-flex align-items-center flex-wrap">
-            <span class="text-muted">
-                {{ exports|length }} export{{ '' if exports|length == 1 else 's' }} registered
-                {% if withcache_url %}
-                <span class="vr"></span>
-                exports from <code>{{ withcache_url }}</code>'s cache
-                {% else %}
-                <span class="vr"></span>
-                <span class="text-warning">no NBDMUX_WITHCACHE_URL configured; nothing to pick from</span>
-                {% endif %}
-            </span>
+        <span class="subnav-jumps d-flex align-items-center flex-wrap">
+            <a href="#exports-list">Exports</a>
         </span>
-        {# Create-export form pinned to the right of the subnav so
-           operators can register a new export without leaving the
-           page. The picker options are the catalog entries that
-           withcache has already downloaded (`GET /catalog`
-           filtered on ``downloaded_at != null``); nbdmux does no
-           auto-fetch. The export name is derived from the entry's
-           URL basename. Pre-warmed {name, file} exports have no
-           browser form because the operator's already shelled in
-           to place the file. #}
-        <span class="ms-auto d-flex align-items-center gap-2">
-            {% if catalog_entries %}
-            <form method="post" action="/admin/create_export"
-                  class="d-flex align-items-center gap-1 m-0">
-                <label class="form-label small mb-0 me-1 text-nowrap" for="create-export-catalog">
-                    Export from downloaded:
-                </label>
-                <select required class="form-select form-select-sm"
-                        id="create-export-catalog" name="src_url"
-                        style="max-width: 32rem;"
-                        title="Pick a downloaded catalog entry from withcache. Nbdmux derives the export name from the URL basename, decompresses via withcache's cache, and stages the resulting .img at <images-dir>/<name>.img.">
-                    {% for e in catalog_entries %}
-                    <option value="{{ e.src }}">
-                        {{ e.name or e.src }}{% if e.format %} ({{ e.format }}){% endif %}
-                    </option>
-                    {% endfor %}
-                </select>
-                <button type="submit" class="btn btn-sm btn-primary text-nowrap">
-                    <i class="bi bi-cloud-plus me-1"></i>Export
-                </button>
-            </form>
-            {% elif not withcache_url %}
-            <span class="text-warning small">
-                <i class="bi bi-exclamation-triangle me-1"></i>Set NBDMUX_WITHCACHE_URL to pick from downloaded catalog entries.
-            </span>
-            {% elif catalog_error %}
-            <span class="text-danger small" title="{{ catalog_error }}">
-                <i class="bi bi-x-octagon me-1"></i>catalog unreachable
-            </span>
-            {% else %}
-            <span class="text-muted small">
-                <i class="bi bi-inbox me-1"></i>
-                No downloaded catalog entries. Add + Download on
-                <a href="{{ withcache_url|trim('/') }}/ui/catalog">{{ withcache_url|trim('/') }}/ui/catalog</a>.
-            </span>
-            {% endif %}
-        </span>
+        {% if catalog_entries %}
+        {# Create-export form on the right: picker options come from
+           withcache's ``GET /catalog`` (which since withcache v0.11.0
+           already contains only downloaded entries). The export name
+           is derived from the entry's URL basename on the server
+           side. Pre-warmed ``{name, file}`` exports have no browser
+           form -- the operator is already shelled in to place the
+           file. #}
+        <form method="post" action="/admin/create_export"
+              class="subnav-actions d-flex align-items-center gap-1 m-0 ms-auto">
+            <label class="form-label small mb-0 me-1 text-nowrap" for="create-export-catalog">
+                From catalog:
+            </label>
+            <select required class="form-select form-select-sm"
+                    id="create-export-catalog" name="src_url"
+                    style="max-width: 32rem;"
+                    title="Pick a catalog entry from withcache. Nbdmux derives the export name from the URL basename, decompresses via withcache's cache, and stages the resulting .img at <images-dir>/<name>.img.">
+                {% for e in catalog_entries %}
+                <option value="{{ e.src }}">
+                    {{ e.name or e.src }}{% if e.format %} ({{ e.format }}){% endif %}
+                </option>
+                {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-sm btn-primary text-nowrap">
+                <i class="bi bi-cloud-plus me-1"></i>Export
+            </button>
+        </form>
+        {% endif %}
     </div>
 </nav>
 {% endblock %}
 
 {% block intro %}
-{# One-sentence context so an operator landing here knows what
-   nbdmux does without hunting for the README. #}
+{# One-sentence context + operator-actionable hints for the two
+   empty-state axes (withcache unconfigured, catalog empty /
+   unreachable). Keeping these OUT of the subnav so the strip
+   holds jump links + form only, matching bty. #}
 <div class="alert alert-secondary small mb-3">
     Each row is an nbd-server export the multiplexer serves over
     TCP. Pre-warmed exports point at an existing file on disk;
-    catalog-picker exports read from withcache's downloaded
-    cache and decompress into <code>&lt;images-dir&gt;/&lt;name&gt;.img</code>
+    catalog-picker exports read from withcache's cache and
+    decompress into <code>&lt;images-dir&gt;/&lt;name&gt;.img</code>
     before landing at <em>ready</em>. Only <em>ready</em> exports
     are visible to nbd-server on the wire.
 </div>
+{% if not withcache_url %}
+<div class="alert alert-warning small mb-3">
+    <i class="bi bi-exclamation-triangle me-1"></i>
+    <code>NBDMUX_WITHCACHE_URL</code> is not set; the create-export
+    picker needs a withcache upstream to populate its options.
+</div>
+{% elif catalog_error %}
+<div class="alert alert-danger small mb-3" title="{{ catalog_error }}">
+    <i class="bi bi-x-octagon me-1"></i>
+    withcache catalog unreachable at <code>{{ withcache_url }}</code>.
+</div>
+{% elif not catalog_entries %}
+<div class="alert alert-info small mb-3">
+    <i class="bi bi-inbox me-1"></i>
+    No catalog entries yet. Add + Download on
+    <a href="{{ withcache_url|trim('/') }}/ui/catalog">{{ withcache_url|trim('/') }}/ui/catalog</a>.
+</div>
+{% endif %}
 {% endblock %}
 
 {% block content %}
-<div class="card mb-3">
+<div class="card mb-3" id="exports-list">
     <div class="card-header bg-light fw-semibold d-flex flex-wrap align-items-center gap-2 py-2">
         <span class="text-nowrap"><i class="bi bi-list-ul me-1"></i>Exports</span>
     </div>

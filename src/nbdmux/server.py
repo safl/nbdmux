@@ -7,16 +7,21 @@ Post-v0.3.0 the HTTP control plane + operator UI moved out to
 :mod:`nbdmux._app` (FastAPI + Jinja + Bootstrap); this module now
 owns the parts of the daemon that stay stdlib:
 
-- ``Store``: SQLite-backed exports table, ``record_export`` /
-  ``delete_export`` / ``list_exports``. Single ``state.db`` under
-  ``--data-dir``.
+- ``Store``: SQLite-backed exports table, ``upsert_export`` /
+  ``get_export`` / ``delete_export`` / ``list_exports`` /
+  ``list_ready_exports`` / ``list_pending_exports`` /
+  ``set_status``. Single ``state.db`` under ``--data-dir``.
 - ``Auth``: server-signed HMAC cookie, ``NBDMUX_ADMIN_PASSWORD`` env
   gate. Signing key resolution via :func:`resolve_secret`.
 - ``NbdServer``: writes nbd-server's INI config and supervises the
   subprocess; SIGHUP on every export-set change to reload without
   dropping in-flight connections.
 - ``Warmer``: fetch + decompress worker that walks each queued
-  export through queued -> fetching -> decompressing -> ready.
+  export through queued -> fetching -> decompressing -> ready. Fetches
+  go through the configured withcache (``NBDMUX_WITHCACHE_URL``);
+  since withcache v0.10.0 requires an operator Download before serving
+  bytes, the fetch step is a guaranteed cache hit rather than an
+  origin pull.
 - ``main``: argparse + ``uvicorn.run`` against
   :func:`nbdmux._app.create_app`. The FastAPI lifespan hook owns
   Warmer + NbdServer start / stop.

@@ -266,14 +266,15 @@ class CatalogPickerRenderTests(_AdminFormsBase):
     def test_picker_shows_empty_hint_when_catalog_is_empty(self) -> None:
         # An empty catalog (either legitimately empty on the
         # withcache side, or everything staged and not yet
-        # downloaded) yields the same empty-state hint. Withcache
-        # is the operator's next stop.
+        # downloaded) yields the empty-state hint. Withcache is
+        # the operator's next stop. Since v0.5.1 that hint lives
+        # in the intro box, not in the subnav.
         self._patch_catalog([])
         try:
             body = self.client.get("/ui/exports").text
         finally:
             self._restore_catalog()
-        self.assertIn("No downloaded catalog entries", body)
+        self.assertIn("No catalog entries yet", body)
 
     def test_picker_shows_unreachable_hint_on_transport_error(self) -> None:
         import urllib.error as _urlerr

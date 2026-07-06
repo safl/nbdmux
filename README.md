@@ -96,25 +96,35 @@ fdisk -l /dev/nbd0   # the .img's partition table
 | GET    | `/exports`               | -                                             | array of exports |
 | POST   | `/exports`               | `{name, file, readonly?: bool}` (pre-warmed) OR `{name, src_url}` (warm via withcache) | the new export |
 | DELETE | `/exports/{name}`        | -                                             | 204 (warm-created also unlinks the .img) |
-| POST   | `/admin/create_export`   | form-encoded `name=...&src_url=...`           | 303 to `/` (dashboard) |
+| POST   | `/admin/create_export`   | form-encoded `src_url=...`                    | 303 to `/ui/exports?error=<msg>` on failure, else `/ui/exports` |
 | GET    | `/healthz`               | -                                             | `ok` (200) when nbd-server is up, `nbd-server not running` (503) when down |
-| GET    | `/`                      | -                                             | operator dashboard |
+| GET    | `/ui/exports`            | -                                             | operator dashboard |
 
-`POST /admin/create_export` is what the operator UI's New Export
-subnav form submits to; it's the form-encoded counterpart of the
-JSON `POST /exports {name, src_url}` warm path. Validation
-failures 303 back to `/?err=<kind>` and the dashboard renders an
-alert banner with a friendly reason.
+`POST /admin/create_export` is what the operator UI's create-export
+subnav form submits to. The form only carries ``src_url``; the
+export name is derived from the URL basename (sanitised to the
+export-name allowlist) so operators don't pick names by hand.
+Validation failures 303 back to `/ui/exports?error=<msg>` and the
+page renders the error inline.
 
 ## Operator UI
 
-The dashboard at `http://<host>:8082/` is a one-page view of the
-nbd-server process, all registered exports, and (top-right of the
-sub-navigation strip) a New Export form. It uses Bootstrap 5 +
-Bootstrap Icons + HTMX bundled offline; the same chrome as bty and
-withcache, only the primary hue differs (magenta -- the terminus of
-the trio's navy -> dark-magenta -> magenta gradient) so operators
-tell the three consoles apart at a glance.
+The dashboard at `http://<host>:8082/ui/exports` shows all registered
+exports plus (top-right of the sub-navigation strip) a create-export
+`<select>` populated from `<NBDMUX_WITHCACHE_URL>/catalog`. It uses
+Bootstrap 5 + Bootstrap Icons + HTMX bundled offline; the same chrome
+as bty and withcache, only the primary hue differs (magenta -- the
+terminus of the trio's navy -> dark-magenta -> magenta gradient) so
+operators tell the three consoles apart at a glance.
+
+## Withcache floor
+
+Requires **withcache >= 0.11.0**. That release changed
+`GET /catalog` to return only downloaded entries; the nbdmux picker
+lists exactly what's exportable without a defensive downloaded_at
+filter. Older withcache releases will still fetch a catalog but
+staged-not-yet-downloaded entries will surface in the picker and
+the resulting export will fail at fetch time.
 
 ## Auth
 

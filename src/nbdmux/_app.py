@@ -1,10 +1,9 @@
-"""FastAPI app factory for nbdmux (v0.3.0 port).
+"""FastAPI app factory for nbdmux.
 
-Replaces the stdlib ``http.server``-based ``server.py`` request
-handler with a FastAPI application. :func:`create_app` returns a
-FastAPI instance the caller mounts under whatever ASGI server it
-picks -- uvicorn for the daemon (``server.main`` boots it via
-:mod:`uvicorn`) and TestClient for tests.
+:func:`create_app` returns a FastAPI instance the caller mounts
+under whatever ASGI server it picks -- uvicorn for the daemon
+(``server.main`` boots it via :mod:`uvicorn`) and TestClient for
+tests.
 
 Layout mirrors ``bty.web._app``. A ``lifespan`` hook starts the
 Warmer thread + nbd-server subprocess on daemon startup and stops
@@ -209,9 +208,8 @@ def create_app(
     # Runtime objects the JSON handlers reach via ``request.app.state``.
     # Store writes a real state.db under data_dir so tests exercise the
     # SQLite path unchanged. Warmer + NbdServer default to no-op stubs
-    # because the runtime daemon (still stdlib server.py) owns the
-    # actual thread + subprocess. When the port migrates the runtime,
-    # a lifespan hook will hand real instances in here.
+    # for TestClient callers (no thread, no subprocess); the daemon
+    # path's lifespan hook passes real instances.
     app.state.store = store if store is not None else Store(data_dir_str)
     app.state.warmer = warmer if warmer is not None else _NoopWarmer()
     app.state.nbd = nbd if nbd is not None else _NoopNbdServer()
