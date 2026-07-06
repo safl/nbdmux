@@ -238,24 +238,17 @@ class CatalogPickerRenderTests(_AdminFormsBase):
 
         _urlreq.urlopen = self._orig_urlopen  # type: ignore[assignment]
 
-    def test_picker_lists_downloaded_catalog_entries(self) -> None:
-        """Only entries with a ``downloaded_at`` set land in the
-        picker. Since withcache retired auto-fetch on cache miss,
-        an export against an undownloaded entry would just fail at
-        fetch time; the picker refuses to offer it up front so the
-        operator sees exactly what's ready to export."""
+    def test_picker_lists_catalog_entries(self) -> None:
+        """Since withcache v0.11.0 GET /catalog already filters to
+        downloaded entries -- everything the picker sees is by
+        definition exportable. Nbdmux drops the redundant
+        downloaded_at filter and just sanity-checks the row shape."""
         self._patch_catalog(
             [
                 {
                     "name": "ubuntu-24.04",
                     "src": "https://upstream.invalid/ubuntu-24.04.img.gz",
                     "format": "img.gz",
-                    "downloaded_at": "2026-07-06T12:00:00Z",
-                },
-                {  # dropped: no downloaded_at
-                    "name": "not-yet",
-                    "src": "https://upstream.invalid/not-yet.img.gz",
-                    "downloaded_at": None,
                 },
                 {"name": "no-src-drops"},  # dropped: no src
             ]
@@ -267,25 +260,15 @@ class CatalogPickerRenderTests(_AdminFormsBase):
         self.assertIn('name="src_url"', body)
         self.assertIn("https://upstream.invalid/ubuntu-24.04.img.gz", body)
         self.assertIn("ubuntu-24.04", body)
-        # Not-yet-downloaded entries never surface in the picker.
-        self.assertNotIn("not-yet.img.gz", body)
         # And the URL text input is gone.
         self.assertNotIn('type="url"', body)
 
-    def test_picker_shows_empty_hint_when_no_downloaded_entries(self) -> None:
-        # A catalog full of undownloaded entries is functionally
-        # empty from nbdmux's point of view. Same empty-state copy
-        # as an actually-empty catalog so the operator sees the
-        # right next step: hit Download on withcache's /ui/catalog.
-        self._patch_catalog(
-            [
-                {
-                    "name": "not-yet",
-                    "src": "https://upstream.invalid/x.img.gz",
-                    "downloaded_at": None,
-                }
-            ]
-        )
+    def test_picker_shows_empty_hint_when_catalog_is_empty(self) -> None:
+        # An empty catalog (either legitimately empty on the
+        # withcache side, or everything staged and not yet
+        # downloaded) yields the same empty-state hint. Withcache
+        # is the operator's next stop.
+        self._patch_catalog([])
         try:
             body = self.client.get("/ui/exports").text
         finally:
