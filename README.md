@@ -98,7 +98,10 @@ fdisk -l /dev/nbd0   # the .img's partition table
 | DELETE | `/exports/{name}`        | -                                             | 204 (warm-created also unlinks the .img) |
 | POST   | `/admin/create_export`   | form-encoded `src_url=...`                    | 303 to `/ui/exports?error=<msg>` on failure, else `/ui/exports` |
 | GET    | `/healthz`               | -                                             | `ok` (200) when nbd-server is up, `nbd-server not running` (503) when down |
-| GET    | `/ui/exports`            | -                                             | operator dashboard |
+| GET    | `/ui/dashboard`          | -                                             | landing page: exports + warm + upstream summary |
+| GET    | `/ui/exports`            | -                                             | exports table + create-export picker |
+| GET    | `/ui/events`             | -                                             | append-only audit log (filter + pagination) |
+| POST   | `/admin/events/{id}/ack` | -                                             | 303 to `/ui/events` (marks failure acknowledged) |
 
 `POST /admin/create_export` is what the operator UI's create-export
 subnav form submits to. The form only carries ``src_url``; the
@@ -109,22 +112,25 @@ page renders the error inline.
 
 ## Operator UI
 
-The dashboard at `http://<host>:8082/ui/exports` shows all registered
-exports plus (top-right of the sub-navigation strip) a create-export
-`<select>` populated from `<NBDMUX_WITHCACHE_URL>/catalog`. It uses
-Bootstrap 5 + Bootstrap Icons + HTMX bundled offline; the same chrome
-as bty and withcache, only the primary hue differs (magenta -- the
-terminus of the trio's navy -> dark-magenta -> magenta gradient) so
-operators tell the three consoles apart at a glance.
+`http://<host>:8082/` lands on the Dashboard (exports + warm pipeline +
+upstream summary + Health tripwire + last N audit events). The Exports
+tab shows all registered exports and, top-right on the subnav strip, a
+create-export `<select>` populated from `<NBDMUX_WITHCACHE_URL>/catalog`.
+The Events tab surfaces the append-only audit log with a free-text
+filter and per-page pagination; failure rows carry an ack button that
+clears them from the dashboard tripwire. Settings edits withcache API
+URL, withcache browser URL (for operator-facing cross-links), and log
+level. Chrome uses Bootstrap 5 + Bootstrap Icons + HTMX bundled offline;
+the same as bty and withcache, only the primary hue differs (magenta,
+the terminus of the trio's navy -> dark-magenta -> magenta gradient).
 
 ## Withcache floor
 
-Requires **withcache >= 0.11.0**. That release changed
-`GET /catalog` to return only downloaded entries; the nbdmux picker
-lists exactly what's exportable without a defensive downloaded_at
-filter. Older withcache releases will still fetch a catalog but
-staged-not-yet-downloaded entries will surface in the picker and
-the resulting export will fail at fetch time.
+Requires **withcache >= 0.12.0**. Since 0.11.0 `GET /catalog` returns
+only downloaded entries; 0.12.0 consolidates the UI and 0.13.0 adds the
+events log. Older withcache releases still fetch a catalog but staged
+entries would show in the picker and warm at fetch time; keep the floor
+current.
 
 ## Auth
 

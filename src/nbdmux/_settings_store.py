@@ -3,11 +3,17 @@
 Mirrors :mod:`bty.web._settings_store` in shape. A thin key-value
 store over a ``settings`` table in the same ``state.db``
 :class:`nbdmux.server.Store` writes exports to. Values here are
-persistent overrides for the two knobs an operator wants to change
+persistent overrides for the knobs an operator wants to change
 without redeploying:
 
 - :data:`KEY_WITHCACHE_URL` -- the withcache upstream nbdmux fetches
   from during the warm pipeline. Env: :data:`ENV_WITHCACHE_URL`.
+- :data:`KEY_WITHCACHE_BROWSER_URL` -- operator-facing URL for
+  cross-links from the nbdmux UI to the withcache UI (distinct
+  from the API URL since the internal container hostname is
+  rarely browser-reachable). Env:
+  :data:`ENV_WITHCACHE_BROWSER_URL`. Falls back to the API URL
+  when unset.
 - :data:`KEY_LOG_LEVEL` -- uvicorn / logging level. Env:
   :data:`ENV_LOG_LEVEL`. Default: ``info``.
 
