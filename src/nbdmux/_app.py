@@ -456,18 +456,16 @@ def create_app(
         error: str | None = None,
         _auth_check: None = Depends(require_ui_auth),
     ) -> HTMLResponse:
-        """The operator dashboard: one row per registered export
+        """The exports table view: one row per registered export
         with status pill + progress bar. Reads ``app.state.store``
-        (same instance the JSON API mutates), the withcache URL
-        for the subnav's "warms via ..." indicator, and the
-        withcache catalog so the create-export picker can offer
-        the operator-curated inventory instead of a manual URL
-        field. ``withcache_browser_url`` is a separate setting for
-        the operator-facing cross-link (falls back to
-        ``withcache_url`` when unset). The ``?error=`` query param
-        carries the flash from a failed admin-form submission back
-        into the render context so the redirect target shows the
-        reason inline."""
+        (same instance the JSON API mutates) and the withcache
+        catalog so the create-export picker can offer the
+        operator-curated inventory instead of a manual URL field.
+        ``withcache_browser_url`` is a separate setting for the
+        operator-facing cross-link (falls back to ``withcache_url``
+        when unset). The ``?error=`` query param carries the flash
+        from a failed admin-form submission back into the render
+        context so the redirect target shows the reason inline."""
         exports = app.state.store.list_exports()
         with app.state.store.conn() as conn:
             withcache_url = _settings_store.resolve_withcache_url(conn)
@@ -596,13 +594,13 @@ def create_app(
         error: str | None = None,
         _auth_check: None = Depends(require_ui_auth),
     ) -> HTMLResponse:
-        """Effective-configuration view. Warming card is now form-
-        editable (withcache URL + log level) with the Override /
-        Effective / Default three-column pattern bty uses. Save
-        writes to :mod:`_settings_store`; a rolling deploy sees the
-        new value on the next request without needing to touch env
-        or restart. Env still overrides the default when no DB
-        override is set."""
+        """Effective-configuration view. Warming card is form-
+        editable (withcache URL + withcache browser URL + log level)
+        with the Override / Effective / Default three-column pattern
+        bty uses. Save writes to :mod:`_settings_store`; a rolling
+        deploy sees the new value on the next request without needing
+        to touch env or restart. Env still overrides the default when
+        no DB override is set."""
         session_secret_from_env = bool((os.environ.get("NBDMUX_SESSION_SECRET") or "").strip())
         with app.state.store.conn() as conn:
             withcache_url_override = _settings_store.get(conn, _settings_store.KEY_WITHCACHE_URL)
