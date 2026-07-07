@@ -9,7 +9,7 @@
             <span class="vr"></span>
             <a href="#dash-health">Health</a>
             <span class="vr"></span>
-            <a href="#dash-recent">Recent</a>
+            <a href="#dash-activity">Recent activity</a>
         </span>
     </div>
 </nav>
@@ -102,47 +102,53 @@
     </div>
 </div>
 
-<div class="card mb-3" id="dash-recent">
+<div class="card mb-3" id="dash-activity">
     <div class="card-header bg-light fw-semibold d-flex justify-content-between align-items-center py-2">
-        <span><i class="bi bi-clock-history me-1"></i>Recent exports</span>
-        <a class="small text-decoration-none" href="/ui/exports">Open exports &rarr;</a>
+        <span><i class="bi bi-clock-history me-1"></i>Last {{ recent_events_limit }} events</span>
+        <a class="small text-decoration-none" href="/ui/events">Open events &rarr;</a>
     </div>
     <div class="table-responsive">
         <table class="table table-striped table-hover mb-0 align-middle">
             <thead class="table-light">
                 <tr>
-                    <th>Name</th>
-                    <th style="width: 1%; white-space: nowrap;">Status</th>
-                    <th style="width: 1%; white-space: nowrap;">Size</th>
+                    <th style="width: 1%; white-space: nowrap;">Time</th>
+                    <th style="width: 1%; white-space: nowrap;">Kind</th>
+                    <th>Summary</th>
+                    <th style="width: 1%; white-space: nowrap;">Subject</th>
                 </tr>
             </thead>
             <tbody>
-                {% for e in recent_exports %}
+                {% for e in recent_events %}
                 <tr>
-                    <td class="small font-monospace text-truncate" style="max-width: 32rem;"
-                        title="{{ e.name }}">{{ e.name }}</td>
-                    <td>
-                        {% if e.status == 'ready' %}
-                        <span class="badge bg-success">ready</span>
-                        {% elif e.status == 'pending' %}
-                        <span class="badge bg-info text-dark">pending</span>
-                        {% elif e.status == 'failed' %}
-                        <span class="badge bg-danger">failed</span>
+                    <td class="small text-muted text-nowrap font-monospace">{{ e.ts }}</td>
+                    <td class="small text-nowrap">
+                        {% if e.kind.endswith('failed') %}
+                        <span class="badge bg-danger">{{ e.kind }}</span>
+                        {% elif e.kind.endswith('completed') or e.kind.endswith('created') or e.kind.endswith('succeeded') %}
+                        <span class="badge bg-success">{{ e.kind }}</span>
+                        {% elif e.kind.endswith('cancelled') or e.kind.endswith('deleted') or e.kind.endswith('logout') %}
+                        <span class="badge bg-secondary">{{ e.kind }}</span>
                         {% else %}
-                        <span class="badge bg-secondary">{{ e.status or '-' }}</span>
+                        <span class="badge bg-info text-dark">{{ e.kind }}</span>
                         {% endif %}
                     </td>
-                    <td class="small font-monospace text-nowrap">
-                        {% if e.size %}{{ e.size }}{% else %}<span class="text-muted">-</span>{% endif %}
+                    <td class="small">{{ e.summary }}</td>
+                    <td class="small font-monospace text-truncate" style="max-width: 16rem;"
+                        title="{{ e.subject_kind }}/{{ e.subject_id }}">
+                        {% if e.subject_kind %}
+                        {{ e.subject_kind }}{% if e.subject_id %}<span class="text-muted">/</span>{{ e.subject_id }}{% endif %}
+                        {% else %}
+                        <span class="text-muted">-</span>
+                        {% endif %}
                     </td>
                 </tr>
                 {% endfor %}
-                {% if not recent_exports %}
-                <tr><td colspan="3" class="text-muted text-center py-3">
-                    No exports yet. Pick a catalog entry on
-                    <a href="/ui/exports">Exports</a> or drop a
-                    pre-warmed .img in <code>&lt;images-dir&gt;</code>
-                    and register it via POST /exports.
+                {% if not recent_events %}
+                <tr><td colspan="4" class="text-muted text-center py-3">
+                    No events yet. Actions on Exports and Settings
+                    pages land here as the operator performs them; the
+                    Warmer emits system events as it moves exports
+                    from queued to ready.
                 </td></tr>
                 {% endif %}
             </tbody>

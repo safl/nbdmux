@@ -265,6 +265,8 @@ class Store:
     """
 
     def __init__(self, data_dir: str):
+        from . import _events_log
+
         os.makedirs(data_dir, exist_ok=True)
         self.db_path = os.path.join(data_dir, "state.db")
         self._maybe_rotate_on_schema_mismatch()
@@ -275,6 +277,7 @@ class Store:
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                 (_SCHEMA_VERSION,),
             )
+            _events_log.init(c)
 
     def _maybe_rotate_on_schema_mismatch(self) -> None:
         """If state.db exists but its schema_version disagrees with
@@ -492,6 +495,35 @@ def _resolve_withcache_url(src_url: str) -> str:
     return f"{base}/b/{encoded}"
 
 
+def _warmer_emit(
+    events_log_mod,
+    store: Store,
+    *,
+    kind: str,
+    summary: str,
+    subject_id: str,
+    details: dict | None = None,
+) -> None:
+    """Best-effort emit of a system-actor event from the Warmer.
+    Opens its own short-lived connection so the store lock doesn't
+    stay held across the event write. Any failure (schema drift,
+    sqlite busy) is swallowed."""
+    try:
+        with store.conn() as conn:
+            events_log_mod.record(
+                conn,
+                kind=kind,
+                summary=summary,
+                subject_kind="export",
+                subject_id=subject_id,
+                actor="system",
+                details=details,
+            )
+            conn.commit()
+    except Exception:  # noqa: BLE001 -- worker emit is best-effort
+        pass
+
+
 class Warmer:
     """Single-thread worker that walks each enqueued export through
     fetch -> decompress -> ready. One in-flight job at a time so a
@@ -552,6 +584,8 @@ class Warmer:
                 sys.stderr.write(f"nbdmux: warmer crashed on {name}: {exc}\n")
 
     def _process(self, name: str) -> None:
+        from . import _events_log
+
         row = self._store.get_export(name)
         if row is None:
             sys.stderr.write(f"nbdmux: warmer: row vanished before pickup: {name}\n")
@@ -568,6 +602,14 @@ class Warmer:
                 set_started=True,
                 set_completed=True,
             )
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.warm.failed",
+                summary=f"Warm failed for {name}: no src_url",
+                subject_id=name,
+                details={"error": "no src_url"},
+            )
             return
         try:
             fetch_url = _resolve_withcache_url(src_url)
@@ -579,11 +621,27 @@ class Warmer:
                 set_started=True,
                 set_completed=True,
             )
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.warm.failed",
+                summary=f"Warm failed for {name}: {exc}",
+                subject_id=name,
+                details={"error": str(exc)},
+            )
             return
         format_hint = row["format"] or _detect_format(src_url, None)
         dest = row["file"]
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         self._store.set_status(name, "fetching", set_started=True)
+        _warmer_emit(
+            _events_log,
+            self._store,
+            kind="export.warm.started",
+            summary=f"Warm started for {name}",
+            subject_id=name,
+            details={"src_url": src_url, "fetch_url": fetch_url, "format": format_hint},
+        )
         try:
             written = self._fetch_and_decompress(name, fetch_url, dest, format_hint)
         except Exception as exc:  # noqa: BLE001
@@ -596,12 +654,31 @@ class Warmer:
                 error=f"{type(exc).__name__}: {exc}",
                 set_completed=True,
             )
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.warm.failed",
+                summary=f"Warm failed for {name}: {exc}",
+                subject_id=name,
+                details={
+                    "src_url": src_url,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
             return
         self._store.set_status(
             name,
             "ready",
             bytes_done=written,
             set_completed=True,
+        )
+        _warmer_emit(
+            _events_log,
+            self._store,
+            kind="export.warm.completed",
+            summary=f"Warm completed for {name} ({written} bytes)",
+            subject_id=name,
+            details={"src_url": src_url, "bytes": written},
         )
         # Make the new ready row visible to nbd-server.
         self._nbd.reload(self._store.list_ready_exports())
