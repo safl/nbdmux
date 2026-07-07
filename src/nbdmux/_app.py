@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import __version__, _settings_store
+from . import __version__, _events_log, _settings_store, _table_state
 from ._api import register_api_routes
 from .server import Auth, Store, _derive_export_name, _detect_format, resolve_secret
 
@@ -85,13 +85,18 @@ def _fetch_withcache_catalog(
 def _build_jinja(templates_dir: Path) -> Environment:
     """Configure the Jinja environment. Autoescape is on for all
     ``.html`` templates so operator-supplied strings can't inject
-    markup. Mirrors bty's Environment shape."""
+    markup. ``build_query_string`` + ``per_page_choices`` are
+    exposed as globals so ``ui/_table_macros.html`` renders without
+    threading them through every ``render()`` call. Mirrors bty's
+    Environment shape."""
     env = Environment(
         loader=FileSystemLoader(str(templates_dir)),
         autoescape=True,
         trim_blocks=True,
         lstrip_blocks=True,
     )
+    env.globals["build_query_string"] = _table_state.build_query_string
+    env.globals["per_page_choices"] = list(_table_state.PER_PAGE_CHOICES)
     return env
 
 
@@ -224,8 +229,39 @@ def create_app(
     # table; settings sits alongside it in the same DB.
     with app.state.store.conn() as _c:
         _settings_store.init(_c)
+        _events_log.init(_c)
 
     register_api_routes(app, auth=auth, session_authed_key=SESSION_AUTHED_KEY)
+
+    def _emit(
+        *,
+        kind: str,
+        summary: str,
+        request: Request | None = None,
+        subject_kind: str | None = None,
+        subject_id: str | None = None,
+        actor: str | None = "operator",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """One-shot events emitter used by the UI action handlers."""
+        try:
+            client_host = None
+            if request is not None and request.client is not None:
+                client_host = _events_log.normalize_ip(request.client.host)
+            with app.state.store.conn() as conn:
+                _events_log.record(
+                    conn,
+                    kind=kind,
+                    summary=summary,
+                    subject_kind=subject_kind,
+                    subject_id=subject_id,
+                    actor=actor,
+                    source_ip=client_host,
+                    details=details,
+                )
+                conn.commit()
+        except Exception:  # noqa: BLE001 -- emit is best-effort
+            pass
 
     def render(name: str, request: Request, **ctx: Any) -> HTMLResponse:
         """Render a Jinja template + always-injected context.
@@ -286,17 +322,36 @@ def create_app(
 
     @app.post("/ui/login")
     def ui_login_submit(request: Request, password: str = Form(...)) -> Any:
-        """Verify the password + mint the session flag. On success
-        redirect to ``/ui/dashboard``; on failure re-render the form
-        with an error message."""
+        """Verify the password + mint the session flag."""
         if not auth.check_password(password):
+            _emit(
+                kind="auth.login.failed",
+                summary="Login attempt with wrong password",
+                request=request,
+                subject_kind="auth",
+                actor="operator",
+            )
             return render("ui/login.html", request, error="Invalid password.")
         request.session[SESSION_AUTHED_KEY] = True
+        _emit(
+            kind="auth.login.succeeded",
+            summary="Operator logged in",
+            request=request,
+            subject_kind="auth",
+            actor="operator",
+        )
         return RedirectResponse(url="/ui/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
     @app.post("/ui/logout")
     def ui_logout(request: Request) -> RedirectResponse:
         request.session.clear()
+        _emit(
+            kind="auth.logout",
+            summary="Operator logged out",
+            request=request,
+            subject_kind="auth",
+            actor="operator",
+        )
         return RedirectResponse(url="/ui/login", status_code=status.HTTP_303_SEE_OTHER)
 
     # ---------- Root redirect + operator UI pages -----------------------
@@ -322,7 +377,6 @@ def create_app(
         failed_exports = [e for e in exports if getattr(e, "status", None) == "failed"]
         catalog_entries, catalog_error = _fetch_withcache_catalog(withcache_url)
         catalog_count = len(catalog_entries) if catalog_entries else 0
-        recent_exports = list(exports)[-5:][::-1]
 
         sanity: list[dict[str, Any]] = []
         sanity.append(
@@ -361,6 +415,23 @@ def create_app(
             }
         )
 
+        with app.state.store.conn() as _c:
+            recent_events = _events_log.list_recent(_c)
+            unack_failures = _events_log.count_unacknowledged_failures(_c)
+        if unack_failures:
+            sanity.append(
+                {
+                    "label": "Unacknowledged failures",
+                    "ok": False,
+                    "info": False,
+                    "detail": (
+                        f"{unack_failures} failure event"
+                        f"{'s' if unack_failures != 1 else ''} not yet acknowledged"
+                    ),
+                    "href": "/ui/events?q=failed",
+                    "fix_href": "/ui/events?q=failed",
+                }
+            )
         return render(
             "ui/dashboard.html",
             request,
@@ -373,7 +444,8 @@ def create_app(
             catalog_error=catalog_error,
             withcache_url=withcache_url,
             withcache_browser_url=withcache_browser_url,
-            recent_exports=recent_exports,
+            recent_events=recent_events,
+            recent_events_limit=_events_log.RECENT_EVENTS_LIMIT,
             sanity=sanity,
             nbd_port=app.state.nbd_port,
         )
@@ -443,7 +515,6 @@ def create_app(
         and the dashboard shows the newly queued row. On any
         validation failure, 303 to /ui/exports with an ``?error=``
         query so the operator sees why nothing was created."""
-        del request  # accepted for FastAPI DI symmetry; unused here
         s = (src_url or "").strip()
         if not s:
             return _redirect_with_error("src_url: non-empty string required")
@@ -470,6 +541,14 @@ def create_app(
             format=format_hint,
         )
         app.state.warmer.enqueue(n)
+        _emit(
+            kind="export.created",
+            summary=f"Created export {n} (queued for warm)",
+            request=request,
+            subject_kind="export",
+            subject_id=n,
+            details={"src_url": s, "file": dest, "format": format_hint},
+        )
         return RedirectResponse(url="/ui/exports", status_code=status.HTTP_303_SEE_OTHER)
 
     @app.post("/admin/delete_export/{name}")
@@ -479,15 +558,7 @@ def create_app(
         _auth_check: None = Depends(require_ui_auth),
     ) -> RedirectResponse:
         """UI delete-export: form-encoded POST to the same underlying
-        delete-export flow the JSON DELETE /exports/{name} runs.
-        Idempotent from the operator's perspective (a repeat click
-        on a row that already vanished still lands on /ui/exports;
-        the row just isn't there).
-
-        Warm-created rows (``src_url`` set) also unlink the on-disk
-        .img the daemon owns; pre-warmed rows leave their file alone
-        because the operator placed it there. Same file-cleanup
-        branch the JSON DELETE handler uses."""
+        delete-export flow the JSON DELETE /exports/{name} runs."""
         row = app.state.store.get_export(name)
         existed = app.state.store.delete_export(name)
         app.state.nbd.reload(app.state.store.list_ready_exports())
@@ -496,6 +567,14 @@ def create_app(
             if path:
                 with contextlib.suppress(FileNotFoundError, OSError):
                     Path(path).unlink()
+        if existed:
+            _emit(
+                kind="export.deleted",
+                summary=f"Deleted export {name}",
+                request=request,
+                subject_kind="export",
+                subject_id=name,
+            )
         return RedirectResponse(url="/ui/exports", status_code=status.HTTP_303_SEE_OTHER)
 
     def _redirect_with_error(msg: str) -> RedirectResponse:
@@ -578,8 +657,64 @@ def create_app(
             flash_kind=flash_kind,
         )
 
+    @app.get("/ui/events", response_class=HTMLResponse)
+    def ui_events(
+        request: Request,
+        q: str = "",
+        page: int = 1,
+        per_page: int = 25,
+        _auth_check: None = Depends(require_ui_auth),
+    ) -> HTMLResponse:
+        """Slim audit log view: newest-first, free-text filter,
+        per-page pagination."""
+        needle = (q or "").strip()
+        clamped_per_page = (
+            per_page if per_page in _table_state.PER_PAGE_CHOICES else _table_state.DEFAULT_PER_PAGE
+        )
+        clamped_page = max(1, page)
+        with app.state.store.conn() as conn:
+            total = _events_log.count_events(conn, q=needle)
+            page_state = _table_state.parse_pagination(
+                {"page": str(clamped_page), "per_page": str(clamped_per_page)},
+                total=total,
+            )
+            events = _events_log.search_events(
+                conn,
+                q=needle,
+                offset=page_state.offset,
+                limit=page_state.per_page,
+            )
+        preserved = {
+            "q": needle or None,
+            "per_page": (
+                str(page_state.per_page)
+                if page_state.per_page != _table_state.DEFAULT_PER_PAGE
+                else None
+            ),
+        }
+        return render(
+            "ui/events.html",
+            request,
+            nav_active="events",
+            events=events,
+            q=needle,
+            page=page_state,
+            preserved=preserved,
+        )
+
+    @app.post("/admin/events/{event_id}/ack")
+    def ui_admin_ack_event(
+        event_id: int,
+        _auth_check: None = Depends(require_ui_auth),
+    ) -> RedirectResponse:
+        with app.state.store.conn() as conn:
+            _events_log.set_acknowledged(conn, event_id, True)
+            conn.commit()
+        return RedirectResponse(url="/ui/events", status_code=status.HTTP_303_SEE_OTHER)
+
     @app.post("/admin/settings/warming")
     def ui_admin_settings_warming(
+        request: Request,
         withcache_url: str = Form(""),
         withcache_browser_url: str = Form(""),
         log_level: str = Form(""),
@@ -642,6 +777,25 @@ def create_app(
             os.environ[_settings_store.ENV_WITHCACHE_BROWSER_URL] = wc_browser
         else:
             os.environ.pop(_settings_store.ENV_WITHCACHE_BROWSER_URL, None)
+        _emit(
+            kind="settings.withcache.updated",
+            summary=(
+                f"Withcache URL set to {wc or '(cleared)'}; browser URL {wc_browser or '(cleared)'}"
+            ),
+            request=request,
+            subject_kind="settings",
+            subject_id="withcache",
+            details={"withcache_url": wc, "withcache_browser_url": wc_browser},
+        )
+        if ll:
+            _emit(
+                kind="settings.logging.updated",
+                summary=f"Log level set to {ll}",
+                request=request,
+                subject_kind="settings",
+                subject_id="logging",
+                details={"log_level": ll},
+            )
         return RedirectResponse(
             url="/ui/settings?saved=warming#warming",
             status_code=status.HTTP_303_SEE_OTHER,
