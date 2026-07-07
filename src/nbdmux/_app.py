@@ -279,31 +279,104 @@ def create_app(
     @app.get("/ui/login", response_class=HTMLResponse)
     def ui_login_form(request: Request, error: str | None = None) -> HTMLResponse:
         """Login form. If the operator is already authed, redirect
-        to the Exports view rather than showing the form."""
+        to the Dashboard rather than showing the form."""
         if request.session.get(SESSION_AUTHED_KEY):
-            return RedirectResponse(url="/ui/exports", status_code=status.HTTP_303_SEE_OTHER)  # type: ignore[return-value]
+            return RedirectResponse(url="/ui/dashboard", status_code=status.HTTP_303_SEE_OTHER)  # type: ignore[return-value]
         return render("ui/login.html", request, error=error)
 
     @app.post("/ui/login")
     def ui_login_submit(request: Request, password: str = Form(...)) -> Any:
         """Verify the password + mint the session flag. On success
-        redirect to ``/ui/exports``; on failure re-render the form
+        redirect to ``/ui/dashboard``; on failure re-render the form
         with an error message."""
         if not auth.check_password(password):
             return render("ui/login.html", request, error="Invalid password.")
         request.session[SESSION_AUTHED_KEY] = True
-        return RedirectResponse(url="/ui/exports", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url="/ui/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
     @app.post("/ui/logout")
     def ui_logout(request: Request) -> RedirectResponse:
         request.session.clear()
         return RedirectResponse(url="/ui/login", status_code=status.HTTP_303_SEE_OTHER)
 
-    # ---------- Root redirect + exports placeholder ---------------------
+    # ---------- Root redirect + operator UI pages -----------------------
 
     @app.get("/")
     def _root() -> RedirectResponse:
-        return RedirectResponse(url="/ui/exports", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url="/ui/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.get("/ui/dashboard", response_class=HTMLResponse)
+    def ui_dashboard(
+        request: Request, _auth_check: None = Depends(require_ui_auth)
+    ) -> HTMLResponse:
+        """Landing page: exports + warm pipeline + upstream status
+        at a glance. Same shape as bty + withcache dashboards
+        (jump-link subnav, summary counts, health check list,
+        recent activity)."""
+        with app.state.store.conn() as conn:
+            withcache_url = _settings_store.resolve_withcache_url(conn)
+            withcache_browser_url = _settings_store.resolve_withcache_browser_url(conn)
+        exports = app.state.store.list_exports()
+        ready_exports = [e for e in exports if getattr(e, "status", None) == "ready"]
+        pending_exports = [e for e in exports if getattr(e, "status", None) == "pending"]
+        failed_exports = [e for e in exports if getattr(e, "status", None) == "failed"]
+        catalog_entries, catalog_error = _fetch_withcache_catalog(withcache_url)
+        catalog_count = len(catalog_entries) if catalog_entries else 0
+        recent_exports = list(exports)[-5:][::-1]
+
+        sanity: list[dict[str, Any]] = []
+        sanity.append(
+            {
+                "label": "Withcache upstream",
+                "ok": bool(withcache_url),
+                "info": False,
+                "detail": withcache_url or "(not configured)",
+                "href": "/ui/settings#warming",
+                "fix_href": "/ui/settings#warming",
+            }
+        )
+        if withcache_url:
+            sanity.append(
+                {
+                    "label": "Catalog reachable",
+                    "ok": not catalog_error and catalog_entries is not None,
+                    "info": False,
+                    "detail": catalog_error or f"{catalog_count} entries visible",
+                    "href": "/ui/exports",
+                    "fix_href": "/ui/settings#warming",
+                }
+            )
+        sanity.append(
+            {
+                "label": "Warm pipeline",
+                "ok": len(failed_exports) == 0,
+                "info": False,
+                "detail": (
+                    f"{len(pending_exports)} pending, {len(failed_exports)} failed"
+                    if (pending_exports or failed_exports)
+                    else "idle"
+                ),
+                "href": "/ui/exports",
+                "fix_href": "/ui/exports",
+            }
+        )
+
+        return render(
+            "ui/dashboard.html",
+            request,
+            nav_active="dashboard",
+            exports_total=len(exports),
+            ready_count=len(ready_exports),
+            pending_count=len(pending_exports),
+            failed_count=len(failed_exports),
+            catalog_count=catalog_count,
+            catalog_error=catalog_error,
+            withcache_url=withcache_url,
+            withcache_browser_url=withcache_browser_url,
+            recent_exports=recent_exports,
+            sanity=sanity,
+            nbd_port=app.state.nbd_port,
+        )
 
     @app.get("/ui/exports", response_class=HTMLResponse)
     def ui_exports(
@@ -317,11 +390,16 @@ def create_app(
         for the subnav's "warms via ..." indicator, and the
         withcache catalog so the create-export picker can offer
         the operator-curated inventory instead of a manual URL
-        field. The ``?error=`` query param carries the flash from
-        a failed admin-form submission back into the render
-        context so the redirect target shows the reason inline."""
+        field. ``withcache_browser_url`` is a separate setting for
+        the operator-facing cross-link (falls back to
+        ``withcache_url`` when unset). The ``?error=`` query param
+        carries the flash from a failed admin-form submission back
+        into the render context so the redirect target shows the
+        reason inline."""
         exports = app.state.store.list_exports()
-        withcache_url = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None
+        with app.state.store.conn() as conn:
+            withcache_url = _settings_store.resolve_withcache_url(conn)
+            withcache_browser_url = _settings_store.resolve_withcache_browser_url(conn)
         catalog_entries, catalog_error = _fetch_withcache_catalog(withcache_url)
         return render(
             "ui/exports.html",
@@ -329,6 +407,7 @@ def create_app(
             nav_active="exports",
             exports=exports,
             withcache_url=withcache_url,
+            withcache_browser_url=withcache_browser_url,
             catalog_entries=catalog_entries,
             catalog_error=catalog_error,
             flash=error,
@@ -449,6 +528,10 @@ def create_app(
         with app.state.store.conn() as conn:
             withcache_url_override = _settings_store.get(conn, _settings_store.KEY_WITHCACHE_URL)
             withcache_url_effective = _settings_store.resolve_withcache_url(conn)
+            withcache_browser_url_override = _settings_store.get(
+                conn, _settings_store.KEY_WITHCACHE_BROWSER_URL
+            )
+            withcache_browser_url_effective = _settings_store.resolve_withcache_browser_url(conn)
             log_level_override = _settings_store.get(conn, _settings_store.KEY_LOG_LEVEL)
             try:
                 log_level_effective = _settings_store.resolve_log_level(conn)
@@ -473,6 +556,12 @@ def create_app(
             withcache_url_override=withcache_url_override,
             withcache_url_effective=withcache_url_effective,
             withcache_url_env=(os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip() or None,
+            withcache_browser_url_override=withcache_browser_url_override,
+            withcache_browser_url_effective=withcache_browser_url_effective,
+            withcache_browser_url_env=(
+                os.environ.get(_settings_store.ENV_WITHCACHE_BROWSER_URL) or ""
+            ).strip()
+            or None,
             log_level_override=log_level_override,
             log_level_effective=log_level_effective,
             log_level_error=log_level_error,
@@ -492,11 +581,13 @@ def create_app(
     @app.post("/admin/settings/warming")
     def ui_admin_settings_warming(
         withcache_url: str = Form(""),
+        withcache_browser_url: str = Form(""),
         log_level: str = Form(""),
         _auth_check: None = Depends(require_ui_auth),
     ) -> RedirectResponse:
-        """Persist the Warming card's two knobs. Empty string clears
-        the override so the resolver falls through to env / default;
+        """Persist the Warming card's three knobs (withcache URL,
+        withcache browser URL, log level). Empty string clears the
+        override so the resolver falls through to env / default;
         non-empty stores the value verbatim (after strip).
 
         Invalid log-level values 303 back with ``?error=<msg>`` and
@@ -504,6 +595,7 @@ def create_app(
         Settings render anyway, and rejecting at write time keeps
         the failure loud."""
         wc = (withcache_url or "").strip()
+        wc_browser = (withcache_browser_url or "").strip()
         ll = (log_level or "").strip().lower()
         if ll and ll not in _settings_store.LOG_LEVELS:
             import urllib.parse
@@ -518,6 +610,12 @@ def create_app(
                 _settings_store.set_value(conn, _settings_store.KEY_WITHCACHE_URL, wc)
             else:
                 _settings_store.clear(conn, _settings_store.KEY_WITHCACHE_URL)
+            if wc_browser:
+                _settings_store.set_value(
+                    conn, _settings_store.KEY_WITHCACHE_BROWSER_URL, wc_browser
+                )
+            else:
+                _settings_store.clear(conn, _settings_store.KEY_WITHCACHE_BROWSER_URL)
             if ll:
                 _settings_store.set_value(conn, _settings_store.KEY_LOG_LEVEL, ll)
             else:
@@ -540,6 +638,10 @@ def create_app(
             # env value doesn't stay lost -- persistence is the
             # source of truth while the daemon is up.
             os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        if wc_browser:
+            os.environ[_settings_store.ENV_WITHCACHE_BROWSER_URL] = wc_browser
+        else:
+            os.environ.pop(_settings_store.ENV_WITHCACHE_BROWSER_URL, None)
         return RedirectResponse(
             url="/ui/settings?saved=warming#warming",
             status_code=status.HTTP_303_SEE_OTHER,

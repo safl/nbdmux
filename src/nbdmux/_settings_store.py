@@ -25,6 +25,16 @@ from typing import Any
 KEY_WITHCACHE_URL = "withcache.url"
 ENV_WITHCACHE_URL = "NBDMUX_WITHCACHE_URL"
 
+# Operator-facing browser URL for the withcache upstream. Distinct
+# from KEY_WITHCACHE_URL because the address nbdmux uses to reach
+# withcache from inside the container network (e.g.
+# ``http://withcache:8081``) is rarely the same address the
+# operator's browser can resolve (e.g. ``http://lab-host:8081``).
+# Falls back to KEY_WITHCACHE_URL when unset so single-host deploys
+# work with no extra config.
+KEY_WITHCACHE_BROWSER_URL = "withcache.browser_url"
+ENV_WITHCACHE_BROWSER_URL = "NBDMUX_WITHCACHE_BROWSER_URL"
+
 KEY_LOG_LEVEL = "log.level"
 ENV_LOG_LEVEL = "NBDMUX_LOG_LEVEL"
 DEFAULT_LOG_LEVEL = "info"
@@ -101,6 +111,21 @@ def resolve_withcache_url(conn: sqlite3.Connection) -> str | None:
         return override
     env = (os.environ.get(ENV_WITHCACHE_URL) or "").strip()
     return env or None
+
+
+def resolve_withcache_browser_url(conn: sqlite3.Connection) -> str | None:
+    """DB override > $NBDMUX_WITHCACHE_BROWSER_URL > resolved
+    withcache.url. Used to render operator-facing cross-links to
+    the withcache UI from nbdmux pages so the link is reachable
+    from the operator's browser even when the API URL points at an
+    internal container hostname."""
+    override = get(conn, KEY_WITHCACHE_BROWSER_URL)
+    if override:
+        return override
+    env = (os.environ.get(ENV_WITHCACHE_BROWSER_URL) or "").strip()
+    if env:
+        return env
+    return resolve_withcache_url(conn)
 
 
 def resolve_log_level(conn: sqlite3.Connection) -> str:

@@ -155,6 +155,39 @@
                         {% endif %}
                     </td>
                 </tr>
+                {# Withcache browser URL: separate from the API URL
+                   above because the internal container hostname the
+                   Warmer resolves is rarely browser-reachable. This
+                   is the URL nbdmux embeds in operator-facing
+                   cross-links (e.g. the "Add + Download on ..."
+                   hint on the Exports page). Falls back to the API
+                   URL when unset so single-host deploys work with
+                   no extra config. #}
+                <tr>
+                    <td><i class="bi bi-window me-1"></i>Withcache browser URL</td>
+                    <td>
+                        <input type="url" class="form-control form-control-sm font-monospace"
+                               name="withcache_browser_url"
+                               placeholder="http://lab-host:8081"
+                               value="{{ withcache_browser_url_override or '' }}">
+                    </td>
+                    <td>
+                        {% if withcache_browser_url_effective %}
+                        <code class="small">{{ withcache_browser_url_effective }}</code>
+                        {% else %}
+                        <span class="text-muted small">-</span>
+                        {% endif %}
+                    </td>
+                    <td class="text-muted small">
+                        URL the operator's browser can reach withcache
+                        on. Override wins over
+                        <code>$NBDMUX_WITHCACHE_BROWSER_URL</code>;
+                        empty falls back to the Withcache URL above.
+                        {% if withcache_browser_url_env %}
+                        Env currently: <code>{{ withcache_browser_url_env }}</code>.
+                        {% endif %}
+                    </td>
+                </tr>
                 {# Log level: dropdown of the closed uvicorn set. Persists
                    in the DB but applies on next restart (uvicorn latches
                    the level at boot). #}

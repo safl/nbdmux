@@ -11,6 +11,15 @@ NBDMUX_ADMIN_PASSWORD=
 # The typical bty deploy points this at the sibling withcache container.
 NBDMUX_WITHCACHE_URL=
 
+# Optional: URL the operator's browser can reach withcache on. Used
+# only to render cross-links from nbdmux pages to the withcache UI.
+# Falls back to NBDMUX_WITHCACHE_URL when unset. Distinct from the
+# API URL because the container-internal hostname the Warmer resolves
+# (``http://withcache:8081``) is rarely reachable from the operator's
+# browser; set this to the host-published address (e.g.
+# ``http://lab-host:8081``) so the link works.
+#NBDMUX_WITHCACHE_BROWSER_URL=
+
 # Optional: signed-cookie HMAC key. Empty (or absent) = auto-generate
 # a fresh 64-hex key at first start and persist it under /data. Set
 # explicitly to keep cookies valid across a container rebuild that
