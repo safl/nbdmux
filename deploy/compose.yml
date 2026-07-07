@@ -16,6 +16,9 @@ services:
       # here means nbdmux logs a startup warning and rejects src_url
       # POSTs. Point at the sibling withcache in the bty integration.
       NBDMUX_WITHCACHE_URL: "${NBDMUX_WITHCACHE_URL:-}"
+      # Optional operator-facing withcache URL for cross-links in
+      # the nbdmux UI; falls back to NBDMUX_WITHCACHE_URL when unset.
+      NBDMUX_WITHCACHE_BROWSER_URL: "${NBDMUX_WITHCACHE_BROWSER_URL:-}"
       # Optional signed-cookie HMAC key; unset = auto-generate + persist.
       NBDMUX_SESSION_SECRET: "${NBDMUX_SESSION_SECRET:-}"
     ports:

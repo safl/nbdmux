@@ -87,21 +87,21 @@ class FastAPIScaffoldTests(unittest.TestCase):
         self.assertEqual(r.status_code, 303)
         self.assertEqual(r.headers["location"], "/ui/login")
 
-    def test_root_redirects_to_exports(self) -> None:
+    def test_root_redirects_to_dashboard(self) -> None:
         r = self.client.get("/")
         self.assertEqual(r.status_code, 303)
-        self.assertEqual(r.headers["location"], "/ui/exports")
+        self.assertEqual(r.headers["location"], "/ui/dashboard")
 
     def test_ui_login_wrong_password_re_renders_with_error(self) -> None:
         r = self.client.post("/ui/login", data={"password": "not-the-password"})
         self.assertEqual(r.status_code, 200)
         self.assertIn("Invalid password", r.text)
 
-    def test_ui_login_valid_password_sets_session_and_reaches_exports(self) -> None:
+    def test_ui_login_valid_password_sets_session_and_reaches_dashboard(self) -> None:
         r = self.client.post("/ui/login", data={"password": TEST_PASSWORD}, follow_redirects=False)
         self.assertEqual(r.status_code, 303)
-        self.assertEqual(r.headers["location"], "/ui/exports")
-        r2 = self.client.get("/ui/exports")
+        self.assertEqual(r.headers["location"], "/ui/dashboard")
+        r2 = self.client.get("/ui/dashboard")
         self.assertEqual(r2.status_code, 200)
         self.assertIn("NBDMUX", r2.text)
         self.assertIn("brand-accent", r2.text)

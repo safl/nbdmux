@@ -66,8 +66,15 @@
 {% elif not catalog_entries %}
 <div class="alert alert-info small mb-3">
     <i class="bi bi-inbox me-1"></i>
-    No catalog entries yet. Add + Download on
-    <a href="{{ withcache_url|trim('/') }}/ui/catalog">{{ withcache_url|trim('/') }}/ui/catalog</a>.
+    No catalog entries yet.
+    {% if withcache_browser_url %}
+    {% set _wc_ui = withcache_browser_url.rstrip('/') ~ '/ui/catalog' %}
+    Add + Download on <a href="{{ _wc_ui }}">{{ _wc_ui }}</a>.
+    {% else %}
+    Add + Download on the withcache UI (configure
+    <code>NBDMUX_WITHCACHE_BROWSER_URL</code> or set it on
+    Settings so the link resolves to a browser-reachable address).
+    {% endif %}
 </div>
 {% endif %}
 {% endblock %}

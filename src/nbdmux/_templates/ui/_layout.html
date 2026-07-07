@@ -189,10 +189,9 @@
     <div class="container">
         {# Brand pill doubles as the click-to-dashboard link (same
            convention as bty + withcache). The ``brand-active`` state
-           lights when the operator is on the root ``/ui/exports``
-           page so the brand pill signals "you are here." #}
-        <a class="navbar-brand fw-semibold {% if nav_active == 'exports' %}brand-active{% endif %}"
-           href="/ui/exports">
+           lights when the operator is on ``/ui/dashboard``. #}
+        <a class="navbar-brand fw-semibold {% if nav_active == 'dashboard' %}brand-active{% endif %}"
+           href="/ui/dashboard">
             <i class="bi bi-hdd-network me-1"></i>NBDMUX
         </a>
         {% if logged_in %}
