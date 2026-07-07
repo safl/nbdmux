@@ -35,7 +35,7 @@ import ipaddress
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -144,7 +144,7 @@ def record(
 ) -> int:
     """Insert one event row. Returns the new row id. Caller owns
     the transaction."""
-    ts = datetime.now(UTC).isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     details_json = json.dumps(details) if details is not None else None
     cur = conn.execute(
         """
