@@ -24,9 +24,10 @@ container, no third-party Python deps. Operationally:
 
 | Path                       | What it is                                                              |
 |----------------------------|-------------------------------------------------------------------------|
-| `src/nbdmux/server.py`     | The daemon. HTTP control plane + nbd-server subprocess management + operator UI (Bootstrap 5 + Bootstrap Icons + HTMX, matches bty's chrome) |
-| `src/nbdmux/client.py`     | Stdlib-only Python client library for other tools                           |
-| `deploy/Containerfile`     | Single-image deploy (Python + nbd-server)                                   |
+| `src/nbdmux/server.py`     | The daemon: exports table (SQLite) + Warmer worker + NbdServer supervisor + events audit log |
+| `src/nbdmux/_app.py`       | FastAPI app factory + operator UI wiring (Bootstrap 5 + Bootstrap Icons + HTMX, matches bty + withcache chrome) |
+| `src/nbdmux/client.py`     | Stdlib-only Python client library for other tools                       |
+| `deploy/Containerfile`     | Single-image deploy (Python + nbd-server)                               |
 | `deploy/compose.yml`       | Reference compose stack                                                 |
 
 ## System dependency
