@@ -788,89 +788,122 @@ class Warmer:
         """Stream ``url`` through the matching decompressor into
         ``dest``. Returns the number of decompressed bytes written.
 
-        The fetch + decompress are pipelined via a subprocess that
-        reads gzip/zstd/xz from stdin and writes raw bytes to stdout;
-        urllib feeds the upstream response into the pipe so peak disk
-        is the destination file, not destination + an intermediate
-        compressed staging copy.
+        Pipeline shape:
+
+        - Raw ``img`` -- ``curl -o <dest>.inflight <url>`` directly.
+        - ``img.gz`` / ``img.zst`` / ``img.xz`` -- ``curl <url> |
+          gunzip -c > <dest>.inflight`` (or zstd/xz). curl's stdout
+          becomes the decompressor's stdin as a KERNEL pipe -- Python
+          never sees the bytes, so multi-GiB warms don't pay per-chunk
+          GIL + object-alloc overhead.
 
         ``format_hint`` is authoritative -- callers get it from
         :func:`_detect_format` which reads withcache's catalog when
         available. No byte-sniffing here; if the hint disagrees with
-        the on-wire content the decompressor will error out loudly
-        and the Warmer marks the export ``failed``.
+        the on-wire content the decompressor errors out loudly and
+        the Warmer marks the export ``failed``.
 
-        Progress is updated in the DB every ~5% so the dashboard's
-        progress bar advances without thrashing sqlite.
+        Progress is tracked by a background thread that ``stat()``s
+        the growing ``.inflight`` file every second and updates the
+        DB when the size advances by a chunk. This surfaces
+        DECOMPRESSED bytes (what the operator cares about) instead
+        of the upstream compressed byte count. Total size for the
+        progress ratio is left ``None`` -- upstream's Content-Length
+        is compressed and doesn't translate cleanly. The dashboard
+        renders raw MiB when no total is set, which is fine for a
+        one-off warm.
         """
-        import urllib.request
-
         tmp = dest + ".inflight"
-        with urllib.request.urlopen(url) as resp:  # noqa: S310
-            content_length = resp.headers.get("Content-Length")
-            bytes_total = int(content_length) if content_length else None
-            if bytes_total:
-                self._store.set_status(
-                    name,
-                    "fetching",
-                    bytes_total=bytes_total,
-                )
-            self._store.set_status(name, "decompressing")
-            proc: subprocess.Popen[bytes] | None
-            writer: Any
-            if format_hint in ("img", ""):
-                # No decompression -- just copy bytes.
-                proc = None
-                writer = open(tmp, "wb")  # noqa: SIM115
-            else:
-                cmd = _decompressor_cmd(format_hint)
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=open(tmp, "wb"),  # noqa: SIM115
+        # Clear any leftover from a previously-crashed warm so
+        # stat()-based progress starts from 0 and the final os.replace
+        # sees an intact file.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+        self._store.set_status(name, "decompressing")
+
+        # curl args:
+        #   -sS        silence progress meter itself, keep errors
+        #   -L         follow redirects (withcache doesn't emit them
+        #              today but the shim/oras path may in future)
+        #   --fail     non-2xx -> non-zero exit + no body
+        #   --retry    3 attempts with backoff on transient errors
+        curl_argv = ["curl", "-sSL", "--fail", "--retry", "3", "--retry-delay", "1"]
+        pipeline: list[subprocess.Popen[bytes]]
+        if format_hint in ("img", ""):
+            # No decompression: curl writes straight to the inflight file.
+            pipeline = [
+                subprocess.Popen(
+                    [*curl_argv, "-o", tmp, url],
                     stderr=subprocess.PIPE,
                 )
-                writer = proc.stdin
-            assert writer is not None
-            try:
-                written = 0
-                last_progress_bucket = 0
-                chunk_size = 1024 * 1024
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    writer.write(chunk)
-                    written += len(chunk)
-                    if bytes_total:
-                        bucket = int((written * 20) // bytes_total)
-                        if bucket > last_progress_bucket:
-                            last_progress_bucket = bucket
-                            self._store.set_status(
-                                name,
-                                "decompressing",
-                                bytes_done=written,
-                            )
-            finally:
-                if proc is not None:
-                    assert proc.stdin is not None
-                    proc.stdin.close()
+            ]
+        else:
+            decompressor_cmd = _decompressor_cmd(format_hint)
+            curl_proc = subprocess.Popen(
+                [*curl_argv, url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert curl_proc.stdout is not None
+            decomp_proc = subprocess.Popen(
+                decompressor_cmd,
+                stdin=curl_proc.stdout,
+                stdout=open(tmp, "wb"),  # noqa: SIM115
+                stderr=subprocess.PIPE,
+            )
+            # Close our copy of the read end so SIGPIPE reaches curl
+            # if the decompressor dies mid-stream.
+            curl_proc.stdout.close()
+            pipeline = [curl_proc, decomp_proc]
+
+        # Background progress watcher. Guarded stat() so a not-yet-
+        # created file (curl still connecting) doesn't blow up.
+        stop_flag = threading.Event()
+        progress_chunk = 32 * 1024 * 1024  # emit every ~32 MiB
+
+        def _watch() -> None:
+            last_reported = 0
+            while not stop_flag.wait(1.0):
+                try:
+                    sz = os.stat(tmp).st_size
+                except FileNotFoundError:
+                    continue
+                if sz - last_reported >= progress_chunk:
+                    last_reported = sz
+                    with contextlib.suppress(Exception):
+                        self._store.set_status(
+                            name, "decompressing", bytes_done=sz
+                        )
+
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
+
+        try:
+            # Wait for every process in the pipeline. Order matters
+            # only for error reporting -- both procs get reaped either
+            # way.
+            for proc in pipeline:
+                rc = proc.wait()
+                if rc != 0:
                     err = b""
                     if proc.stderr is not None:
                         err = proc.stderr.read()
-                    rc = proc.wait()
-                    if rc != 0:
-                        # ``decode(errors="replace")`` -- ``'replace'`` is the
-                        # error handler, not a codec name; ``err.decode('replace')``
-                        # (the previous form) raises LookupError instead of
-                        # surfacing the decompressor's stderr.
-                        raise RuntimeError(
-                            f"decompressor exited rc={rc}: {err.decode('utf-8', errors='replace')}"
-                        )
-                else:
-                    writer.close()
-        # The decompressed-size = the size on disk (after the
-        # decompressor wrote everything through).
+                    stage = "curl" if proc is pipeline[0] else "decompressor"
+                    raise RuntimeError(
+                        f"{stage} exited rc={rc}: "
+                        f"{err.decode('utf-8', errors='replace').strip()}"
+                    )
+        finally:
+            stop_flag.set()
+            watcher.join(timeout=2.0)
+            # Drain any remaining stderr on each proc so ``stderr``
+            # PIPEs don't leak. Non-zero rc has already surfaced above.
+            for proc in pipeline:
+                if proc.stderr is not None:
+                    with contextlib.suppress(Exception):
+                        proc.stderr.close()
+
         final_size = os.path.getsize(tmp)
         os.replace(tmp, dest)
         self._store.set_status(name, "decompressing", bytes_done=final_size)
