@@ -1,6 +1,6 @@
-"""nbdmux daemon -- pipeline state machine + nbd-server subprocess supervision.
+"""nbdmux daemon -- pipeline state machine + nbdkit subprocess supervision.
 
-One Python process; one supervised ``nbd-server`` child; a SQLite
+One Python process; one supervised ``nbdkit`` child; a SQLite
 state.db tracking registered exports so a daemon restart restores them.
 
 Post-v0.3.0 the HTTP control plane + operator UI moved out to
@@ -13,21 +13,29 @@ owns the parts of the daemon that stay stdlib:
   ``set_status``. Single ``state.db`` under ``--data-dir``.
 - ``Auth``: server-signed HMAC cookie, ``NBDMUX_ADMIN_PASSWORD`` env
   gate. Signing key resolution via :func:`resolve_secret`.
-- ``NbdServer``: writes nbd-server's INI config and supervises the
-  subprocess; SIGHUP on every export-set change to reload without
-  dropping in-flight connections.
+- ``NbdServer``: supervises a single nbdkit child that serves
+  ``<images_dir>`` via the ``file`` plugin's ``dir=`` mode. Each
+  regular file in the directory is exposed as an NBD export whose
+  name equals its filename. The ``cow`` filter is always applied so
+  clients see a per-connection writable overlay while the backing
+  file stays untouched. Since v0.8.0 (was ``nbd-server -d -C conf``
+  + SIGHUP reload).
 - ``Warmer``: fetch + decompress worker that walks each queued
   export through queued -> fetching -> decompressing -> ready. Fetches
   go through the configured withcache (``NBDMUX_WITHCACHE_URL``);
   since withcache v0.10.0 requires an operator Download before serving
   bytes, the fetch step is a guaranteed cache hit rather than an
-  origin pull.
+  origin pull. Format is looked up from withcache's catalog entry
+  (:func:`_lookup_withcache_format`) so OCI / ORAS artifacts resolve
+  to the correct compression without URL-suffix guessing.
 - ``main``: argparse + ``uvicorn.run`` against
   :func:`nbdmux._app.create_app`. The FastAPI lifespan hook owns
   Warmer + NbdServer start / stop.
 
-The system-level dependency is ``nbd-server``
-(Debian / Ubuntu: ``apt install nbd-server``; Fedora: ``dnf install nbd``).
+The system-level dependency is ``nbdkit`` >= 1.44 (Ubuntu 24.04+ /
+Debian forky+; the container ships Ubuntu 26.04's 1.46). Earlier
+nbdkit versions silently misroute the ``cow`` filter under
+multi-export mode.
 """
 
 from __future__ import annotations
@@ -41,7 +49,6 @@ import json
 import os
 import re
 import secrets
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -80,15 +87,21 @@ def _derive_export_name(src_url: str) -> str | None:
 
     Sanitisation: any character not on the export-name allowlist
     is folded to ``-``; leading non-alnum characters are stripped;
-    the result is truncated to 64 chars. Both ``.gz`` /``.zst`` /
-    ``.img`` suffixes are kept intact -- an operator glancing at
-    an export list benefits from the format hint the extension
-    carries.
+    the result is truncated to 64 chars.
+
+    Suffix policy: names ALWAYS end in ``.img``. The Warmer decompresses
+    on the fly (see :func:`_sniff_format`), so what lands on disk is
+    always a raw disk image regardless of what the source URL's
+    extension advertised. Trailing ``.gz`` / ``.zst`` / ``.xz`` are
+    stripped, and ``.img`` is appended if not already present. The
+    export name equals the filename in the images directory
+    (``<images_dir>/<name>``), which is what nbdkit's ``file dir=``
+    mode uses to route ``NBD_OPT_INFO``.
 
     Examples:
-      https://ex/foo.img.gz               -> foo.img.gz
-      https://ex/path/Ubuntu%2024.iso.zst -> Ubuntu-24.iso.zst
-      oras://ghcr.io/owner/repo:tag       -> repo-tag
+      https://ex/foo.img.gz               -> foo.img
+      https://ex/path/Ubuntu%2024.iso.zst -> Ubuntu-24.iso.img
+      oras://ghcr.io/owner/repo:tag       -> repo-tag.img
     """
     from pathlib import PurePosixPath
     from urllib.parse import unquote, urlsplit
@@ -101,12 +114,27 @@ def _derive_export_name(src_url: str) -> str | None:
     if not basename:
         return None
     # Fold everything outside the allowlist to '-'. Then peel
-    # leading non-alnum until we hit a valid first char, and cap
-    # length so we don't slide past the INI-section-safe cap.
+    # leading non-alnum until we hit a valid first char.
     sanitised = _EXPORT_NAME_INVALID_CHARS.sub("-", basename).strip("-")
     while sanitised and not sanitised[0].isalnum():
         sanitised = sanitised[1:]
-    sanitised = sanitised[:_EXPORT_NAME_MAX]
+    if not sanitised:
+        return None
+    # Strip compression suffixes (in longest-match order so ``.img.gz``
+    # peels cleanly to ``foo`` before we re-add ``.img``). ``.img`` is
+    # already-canonical -- leave it alone.
+    for suffix in (".img.gz", ".img.zst", ".img.xz", ".gz", ".zst", ".xz"):
+        if sanitised.lower().endswith(suffix):
+            sanitised = sanitised[: -len(suffix)]
+            break
+    if not sanitised.lower().endswith(".img"):
+        sanitised = f"{sanitised}.img"
+    # Cap length AFTER suffix normalisation so we never truncate a name
+    # that lost its ``.img`` mid-length. If the whole thing is still too
+    # long, drop the leading portion and re-append ``.img``.
+    if len(sanitised) > _EXPORT_NAME_MAX:
+        head = sanitised[: _EXPORT_NAME_MAX - len(".img")]
+        sanitised = f"{head}.img"
     return sanitised or None
 
 
@@ -450,16 +478,83 @@ def _row_to_export(row: sqlite3.Row) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # Warmer -- async fetch + decompress pipeline (one ref at a time)
 # --------------------------------------------------------------------------
+def _lookup_withcache_format(src_url: str) -> str | None:
+    """Return the ``format`` withcache has recorded for ``src_url``.
+
+    Withcache stores an explicit ``format`` field on every catalog
+    entry (``img.gz`` / ``img.zst`` / ``img`` / ...) that's already
+    correct for OCI / ORAS artifacts -- withcache's own resolver
+    reads the ORAS layer's ``org.opencontainers.image.title``
+    annotation, so ``ghcr.io/safl/nosi/ubuntu-2604-headless:2026.W27``
+    lands in the catalog as ``format="img.gz"`` without any URL-suffix
+    guessing. Consuming that field is strictly better than either
+    inspecting the URL suffix or sniffing bytes; both of those were
+    workarounds for information withcache already had.
+
+    Returns the ``format`` string for the matching entry, or ``None``
+    when there's no match (unknown URL, no ``NBDMUX_WITHCACHE_URL``
+    configured, catalog fetch failed, etc.). Callers fall back to
+    URL-suffix detection.
+
+    Match rule: the entry whose ``src`` OR ``resolved_src`` equals
+    ``src_url``. Both fields are compared so an operator who registers
+    an ORAS reference (``src``) gets the same answer as one who
+    registers the resolved HTTPS blob URL (``resolved_src``); nbdmux
+    doesn't have to know which shape withcache canonicalised for a
+    given entry.
+    """
+    import urllib.request
+
+    base = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip().rstrip("/")
+    if not base or not src_url:
+        return None
+    try:
+        with urllib.request.urlopen(  # noqa: S310
+            f"{base}/catalog", timeout=3.0
+        ) as resp:
+            body = json.loads(resp.read())
+    except Exception:  # noqa: BLE001
+        # Best-effort lookup: withcache down / catalog empty / malformed
+        # response all collapse to "no answer", callers fall back.
+        return None
+    entries = body.get("entries") or []
+    for e in entries:
+        if e.get("src") == src_url or e.get("resolved_src") == src_url:
+            fmt = e.get("format")
+            if isinstance(fmt, str) and fmt:
+                return fmt.lower()
+            return None
+    return None
+
+
 def _detect_format(src_url: str | None, override: str | None) -> str:
     """Pick the decompressor for an export.
 
-    ``override`` from the POST body wins (so an operator can force
-    decompression of a URL whose extension is missing or misleading);
-    else derive from the URL suffix; else raw ``img`` as the default.
+    Resolution order:
+
+    1. ``override`` from the caller (POST body ``format`` field, or
+       explicit UI selection). Trumps everything.
+    2. Withcache's catalog entry for ``src_url``, if any. This is the
+       authoritative source: withcache already knows the format from
+       the ORAS layer's title annotation (or the URL suffix, for HTTP
+       sources) and records it explicitly.
+    3. URL suffix on ``src_url``. Reliable for plain-HTTP images that
+       weren't registered via withcache but do carry their format in
+       the filename.
+    4. Fallback ``img`` (raw disk image, no decompression).
+
+    Both (2) and (3) are advisory hints; the Warmer honours whichever
+    the caller ends up with. The main win from (2) is that OCI / ORAS
+    references (``oras://ghcr.io/owner/repo:tag``) resolve to the
+    correct compression without any URL-suffix guessing or byte-magic
+    sniffing on nbdmux's side.
     """
     if override:
         return override.lower()
     if src_url:
+        withcache_fmt = _lookup_withcache_format(src_url)
+        if withcache_fmt:
+            return withcache_fmt
         lowered = src_url.lower()
         if lowered.endswith(".img.gz") or lowered.endswith(".gz"):
             return "img.gz"
@@ -699,6 +794,12 @@ class Warmer:
         is the destination file, not destination + an intermediate
         compressed staging copy.
 
+        ``format_hint`` is authoritative -- callers get it from
+        :func:`_detect_format` which reads withcache's catalog when
+        available. No byte-sniffing here; if the hint disagrees with
+        the on-wire content the decompressor will error out loudly
+        and the Warmer marks the export ``failed``.
+
         Progress is updated in the DB every ~5% so the dashboard's
         progress bar advances without thrashing sqlite.
         """
@@ -795,128 +896,111 @@ def _decompressor_cmd(format_hint: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# NbdServer -- nbd-server subprocess + INI config supervision
+# NbdServer -- nbdkit subprocess supervision
 # --------------------------------------------------------------------------
 class NbdServer:
-    """Manages the nbd-server child and its INI config file.
+    """Manages the nbdkit child that serves the images directory.
 
-    nbd-server (from the classical ``nbd`` project) reads exports from
-    a config file with one ``[name]`` section per export. SIGHUP makes
-    the running daemon reload the config without dropping live
-    connections, so we rewrite the file and signal on every change.
+    nbdkit (``libguestfs.org/nbdkit``) is invoked once with the
+    ``file`` plugin in ``dir=`` mode. Each regular file in
+    ``images_dir`` is served as an NBD export whose name matches the
+    file's basename -- so a ``POST /exports`` that lands
+    ``<images_dir>/<name>.img`` on disk becomes NBD export
+    ``<name>.img`` on the wire without any per-export bookkeeping in
+    the server config. That means no config file, no SIGHUP reload
+    dance, and no risk of a stale INI wedging the subprocess (the
+    pain we hit repeatedly on nbd-server <=0.7).
 
-    The config file lives under ``--data-dir`` so ``data-dir/`` is the
-    one mount/bind point a container deploy needs to persist.
+    The ``cow`` filter is always applied. It transforms every export
+    into copy-on-write: writes from a client are captured in a
+    per-connection in-memory diff, the backing file is never
+    modified, and reads that don't hit modified blocks pass through
+    to the original bytes. This lets ramboot targets mount
+    filesystems read-write without ever mutating the operator's
+    shared image blob. ``cow`` is documented as "Export safe? Yes,
+    since 1.44", which is why the container base ships nbdkit
+    >= 1.46 (see ``deploy/Containerfile``).
+
+    :meth:`reload` is intentionally a no-op: ``dir=`` mode
+    re-enumerates the directory on each client connect, so any file
+    the Warmer just landed appears the next time nbd-client hits the
+    port. Callers still invoke ``reload()`` after mutations for
+    forward-compat + testability; the method exists on the class so
+    signatures stay stable but does nothing beyond a lock touch.
     """
 
     def __init__(
         self,
-        data_dir: str,
+        images_dir: str,
         port: int,
         bind: str,
-        nbd_server_bin: str = "nbd-server",
+        nbdkit_bin: str = "nbdkit",
         pid_file: str | None = None,
     ):
-        self.data_dir = data_dir
-        self.config_path = os.path.join(data_dir, "nbd-server.conf")
-        self.pid_file = pid_file or os.path.join(data_dir, "nbd-server.pid")
+        self.images_dir = images_dir
+        self.pid_file = pid_file
         self.port = port
         self.bind = bind
-        self.bin = nbd_server_bin
+        self.bin = nbdkit_bin
         self._proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
 
-    def _render_config(self, exports: list[dict[str, Any]]) -> str:
-        # nbd-server INI: [generic] for daemon-wide knobs, then one
-        # [<name>] section per export. ``user`` / ``group`` left
-        # unset -- the daemon runs as whatever uid started it (the
-        # container's nbdmux user). ``listenaddr`` / ``port`` pin the
-        # listening socket explicitly so a config change doesn't move
-        # the daemon by accident.
-        lines = [
-            "[generic]",
-            f"    port = {self.port}",
-            f"    listenaddr = {self.bind}",
-            f"    pid_file = {self.pid_file}",
-            "    allowlist = false",
-            "",
-        ]
-        for e in exports:
-            lines.append(f"[{e['name']}]")
-            lines.append(f"    exportname = {e['file']}")
-            if e.get("readonly", True):
-                lines.append("    readonly = true")
-            lines.append("")
-        return "\n".join(lines)
-
-    def write_config(self, exports: list[dict[str, Any]]) -> None:
-        """Atomically rewrite the config file."""
-        body = self._render_config(exports)
-        tmp = self.config_path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(body)
-        os.replace(tmp, self.config_path)
-
     def start(self, exports: list[dict[str, Any]]) -> None:
-        """Write the config + spawn nbd-server in foreground mode.
+        """Spawn nbdkit in foreground mode.
 
-        Idempotent. If ``exports`` is empty, the subprocess is NOT
-        launched: nbd-server hard-fails with ``No configured exports;
-        quitting`` when its INI carries only ``[generic]``, and a
-        fresh nbdmux container legitimately has zero exports until
-        the first ``POST /exports`` completes. The HTTP control
-        plane stays up to accept that POST; ``reload`` lifts off as
-        soon as the first ``ready`` export lands.
+        Idempotent. ``exports`` is accepted for signature compat with
+        the pre-v0.8 nbd-server driver but ignored: ``dir=`` mode
+        auto-discovers what's on disk. The images directory is
+        created if missing so a first-run empty deploy still gets
+        a running listener.
         """
         with self._lock:
             if self._proc and self._proc.poll() is None:
                 return
-            self.write_config(exports)
-            if not exports:
-                # No-op: defer the subprocess to the first reload()
-                # that has at least one export. Loud-on-stderr so
-                # the operator can see the deferred state in
-                # ``podman logs``.
-                sys.stderr.write(
-                    "nbdmux: nbd-server deferred (no exports yet); "
-                    "will start on first POST /exports + ready\n"
-                )
-                return
+            os.makedirs(self.images_dir, exist_ok=True)
             self._spawn()
 
     def reload(self, exports: list[dict[str, Any]]) -> None:
-        """Rewrite the config + SIGHUP the running daemon, OR launch
-        it if this reload is the first non-empty one and the daemon
-        is dormant per :meth:`start`'s deferral. Idempotent."""
+        """No-op under nbdkit ``dir=`` mode; see the class docstring.
+
+        Kept on the class so pre-v0.8 callers (Warmer, JSON API
+        mutation routes, the FastAPI create-export handler) can keep
+        their invocation shape. Removing the calls entirely would
+        make it harder to swap this class in tests with a fake that
+        counts reload invocations.
+        """
         with self._lock:
-            self.write_config(exports)
-            if not exports:
-                # Empty reload: keep the daemon down if it isn't up
-                # yet (deferred-start case); if it IS up, leave it
-                # alone -- the SIGHUP would land on a config nbd-
-                # server would reject, killing the process.
-                if not (self._proc and self._proc.poll() is None):
-                    return
-                # Up-but-now-empty: stop it cleanly rather than let
-                # SIGHUP kill it with the no-exports error.
-                self._terminate_proc_locked()
-                return
-            if self._proc and self._proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    self._proc.send_signal(signal.SIGHUP)
-                return
-            # Daemon dormant + non-empty exports: lift off.
-            self._spawn()
+            # Deliberately empty. Left as an explicit block so future
+            # code that grows a genuine reload need doesn't have to
+            # reshape callers.
+            _ = exports
 
     def _spawn(self) -> None:
-        """Launch the nbd-server subprocess. Caller holds ``self._lock``
-        and has already written the config."""
-        # ``-d`` runs nbd-server in foreground (don't fork). We
-        # supervise the subprocess directly, so an early exit is
-        # observable via ``poll()`` rather than orphaned.
+        """Launch the nbdkit subprocess. Caller holds ``self._lock``.
+
+        Args passed:
+          -p / --ipaddr           external TCP listen (10809 by default)
+          -f                      foreground so we supervise via poll()
+          -P                      pidfile for external readers
+          --newstyle              modern NBD protocol (multi-export)
+          --filter=cow            per-connection writable overlay
+          file dir=<images_dir>   auto-discover exports by filename
+        """
+        argv: list[str] = [
+            self.bin,
+            "-p",
+            str(self.port),
+            "--ipaddr",
+            self.bind,
+            "-f",
+            "--newstyle",
+            "--filter=cow",
+        ]
+        if self.pid_file:
+            argv.extend(["-P", self.pid_file])
+        argv.extend(["file", f"dir={self.images_dir}"])
         self._proc = subprocess.Popen(
-            [self.bin, "-d", "-C", self.config_path],
+            argv,
             stdout=sys.stderr,  # mingle with nbdmux's own logs
             stderr=sys.stderr,
         )
@@ -926,8 +1010,8 @@ class NbdServer:
             rc = self._proc.returncode
             self._proc = None
             raise RuntimeError(
-                f"nbd-server exited immediately (rc={rc}); "
-                f"check {self.config_path} and that the binary is installed"
+                f"nbdkit exited immediately (rc={rc}); "
+                f"check {self.images_dir} exists and that the binary is installed"
             )
 
     def _terminate_proc_locked(self) -> None:
@@ -948,33 +1032,43 @@ class NbdServer:
         return bool(self._proc and self._proc.poll() is None)
 
 
-PROBE_EXPORT_NAME = "probe"
+PROBE_EXPORT_NAME = "probe.img"
 PROBE_EXPORT_SIZE = 1 << 20  # 1 MiB -- small on disk, big enough to `dd` against
 
 
-def _ensure_probe_export(store: Store, data_dir: str) -> None:
-    """Guarantee a ``probe`` export is registered ``ready`` so
-    nbd-server has something to serve on daemon start, regardless of
+def _ensure_probe_export(store: Store, data_dir: str, images_dir: str) -> None:
+    """Guarantee a ``probe.img`` export is registered ``ready`` so
+    nbdkit has something to serve on daemon start, regardless of
     whether any operator has POSTed a real export yet.
 
     Two things this buys us:
 
-    * ``nbd-server`` runs unconditionally, so the "STOPPED" state is
-      an actual signal (the process crashed or refused to start) and
+    * ``nbdkit`` runs unconditionally, so the "STOPPED" state is an
+      actual signal (the process crashed or refused to start) and
       not a design-time deferred idle.
-    * Operators get a permanent smoke-test target -- ``qemu-nbd -c
-      /dev/nbd0 nbd://<host>:10809/probe`` should always answer, so
-      "does the whole warm -> serve pipeline work end-to-end?"
-      collapses to a single command that doesn't require an image
-      to be POSTed first.
+    * Operators get a permanent smoke-test target -- ``nbdinfo
+      nbd://<host>:10809/probe.img`` should always answer, so "does
+      the whole warm -> serve pipeline work end-to-end?" collapses
+      to a single command that doesn't require an image to be
+      POSTed first.
 
     File contents: a 1 MiB payload starting with a magic banner
     string (version-stamped) padded with zeros. Read-only. Written
     idempotently: only regenerated if the file is missing OR its
     size drifted (e.g. someone truncated it) OR the banner version
     differs (so a nbdmux upgrade refreshes the marker).
+
+    Path: under ``<images_dir>`` since nbdkit's ``dir=`` mode serves
+    that directory. Under nbd-server we could point at any absolute
+    path from the INI; under nbdkit the file has to live in the
+    served directory to be discoverable at all.
     """
-    path = os.path.join(data_dir, "probe.img")
+    # ``data_dir`` retained in the signature so future needs (e.g. a
+    # sidecar marker under state) don't require touching every
+    # caller again.
+    _ = data_dir
+    os.makedirs(images_dir, exist_ok=True)
+    path = os.path.join(images_dir, PROBE_EXPORT_NAME)
     banner = f"NBDMUX PROBE v{__version__}\n".encode("ascii")
     need_write = True
     if os.path.isfile(path) and os.path.getsize(path) == PROBE_EXPORT_SIZE:
@@ -984,8 +1078,8 @@ def _ensure_probe_export(store: Store, data_dir: str) -> None:
             need_write = False
     if need_write:
         # Write via a tempfile + rename so a crashed writer never
-        # leaves a half-formed probe.img that would fail nbd-server
-        # startup on the next boot.
+        # leaves a half-formed probe file that would then be visible
+        # (and unusable) as an nbdkit export.
         tmp = path + ".tmp"
         with open(tmp, "wb") as f:
             f.write(banner)
@@ -1025,12 +1119,12 @@ def main() -> int:
     p.add_argument(
         "--data-dir",
         default=os.environ.get("NBDMUX_DATA_DIR"),
-        help="directory for state.db + nbd-server.conf (env: NBDMUX_DATA_DIR)",
+        help="directory for state.db + probe file (env: NBDMUX_DATA_DIR)",
     )
     p.add_argument("--port", type=int, default=8082, help="HTTP control plane port")
     p.add_argument("--nbd-port", type=int, default=10809, help="NBD listening port")
     p.add_argument("--bind", default="0.0.0.0", help="bind address (HTTP + NBD)")
-    p.add_argument("--nbd-server-bin", default="nbd-server", help="nbd-server binary to spawn")
+    p.add_argument("--nbdkit-bin", default="nbdkit", help="nbdkit binary to spawn")
     p.add_argument(
         "--images-dir",
         default=None,
@@ -1066,11 +1160,14 @@ def main() -> int:
     # so the FastAPI app.state carries the same instances the
     # lifespan hook will start / stop. ``_ensure_probe_export`` runs
     # here (not in the lifespan) so a fresh state.db has the probe
-    # row before nbd-server first reads the ready list.
+    # row before nbdkit first enumerates the images directory.
     store = Store(data_dir)
-    _ensure_probe_export(store, data_dir)
+    _ensure_probe_export(store, data_dir, images_dir)
     nbd = NbdServer(
-        data_dir=data_dir, port=args.nbd_port, bind=args.bind, nbd_server_bin=args.nbd_server_bin
+        images_dir=images_dir,
+        port=args.nbd_port,
+        bind=args.bind,
+        nbdkit_bin=args.nbdkit_bin,
     )
     warmer = Warmer(store=store, nbd=nbd, images_dir=images_dir)
 

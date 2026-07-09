@@ -2,16 +2,18 @@
 
 HTTP-controlled NBD-export multiplexer for a small lab. Register local
 disk-image files as named NBD exports over an HTTP control plane; nbdmux
-keeps an `nbd-server` subprocess alive that serves all registered
-exports on a single TCP port. Targets `nbd-client` against that port
-from an initramfs and boot the image with overlayfs over tmpfs for
-writes (see [bty][bty]'s `ramboot` boot mode for the canonical consumer).
+keeps an `nbdkit` subprocess alive that serves the images directory on
+a single TCP port. Every export gets nbdkit's `cow` filter so ramboot
+targets can mount partitions read-write while the backing image stays
+untouched. Targets `nbd-client` against that port from an initramfs and
+boot the image with overlayfs over tmpfs on top for whole-tree writes
+(see [bty][bty]'s `ramboot` boot mode for the canonical consumer).
 
 Designed as a peer to [withcache][withcache]: small lab, single sidecar
 container, no third-party Python deps. Operationally:
 
 ```
-[ bty-web ] --HTTP--> [ nbdmux ]  --supervises-->  [ nbd-server ]
+[ bty-web ] --HTTP--> [ nbdmux ]  --supervises-->  [ nbdkit ]
                           |                              |
                           |                            TCP 10809
                           |                              |
@@ -27,25 +29,29 @@ container, no third-party Python deps. Operationally:
 | `src/nbdmux/server.py`     | The daemon: exports table (SQLite) + Warmer worker + NbdServer supervisor + events audit log |
 | `src/nbdmux/_app.py`       | FastAPI app factory + operator UI wiring (Bootstrap 5 + Bootstrap Icons + HTMX, matches bty + withcache chrome) |
 | `src/nbdmux/client.py`     | Stdlib-only Python client library for other tools                       |
-| `deploy/Containerfile`     | Single-image deploy (Python + nbd-server)                               |
+| `deploy/Containerfile`     | Single-image deploy (Ubuntu 26.04 base for nbdkit >= 1.44)               |
 | `deploy/compose.yml`       | Reference compose stack                                                 |
 
 ## System dependency
 
-nbdmux runs `nbd-server` (from the classical `nbd` project) as a
-subprocess. Install at the OS level:
+nbdmux runs [nbdkit](https://libguestfs.org/nbdkit.1.html) (Red Hat's
+NBD toolkit) as a subprocess, in `file dir=` mode plus the `cow`
+filter. `cow` requires nbdkit >= 1.44 to be safe under multi-export
+(see the "Export safe?" column in `nbdkit-filter-cow(1)`), which is
+why the container base is Ubuntu 26.04 (nbdkit 1.46). Install at the
+OS level for development:
 
 ```sh
-# Debian / Ubuntu
-sudo apt install nbd-server
+# Ubuntu 24.04+ / Debian forky+
+sudo apt install nbdkit
 
 # Fedora
-sudo dnf install nbd
+sudo dnf install nbdkit
 ```
 
 The container deploy bundles it. Also make sure the `nbd` kernel
 module + `nbd-client` are available on the consuming Linux box (the
-target you're booting); they're in the same `nbd` package.
+target you're booting); those are in the classical `nbd` package.
 
 ## Install
 
@@ -98,7 +104,7 @@ fdisk -l /dev/nbd0   # the .img's partition table
 | POST   | `/exports`               | `{name, file, readonly?: bool}` (pre-warmed) OR `{name, src_url}` (warm via withcache) | the new export |
 | DELETE | `/exports/{name}`        | -                                             | 204 (warm-created also unlinks the .img) |
 | POST   | `/admin/create_export`   | form-encoded `src_url=...`                    | 303 to `/ui/exports?error=<msg>` on failure, else `/ui/exports` |
-| GET    | `/healthz`               | -                                             | `ok` (200) when nbd-server is up, `nbd-server not running` (503) when down |
+| GET    | `/healthz`               | -                                             | `ok` (200) when nbdkit is up, `nbdkit not running` (503) when down |
 | GET    | `/ui/dashboard`          | -                                             | landing page: exports + warm + upstream summary |
 | GET    | `/ui/exports`            | -                                             | exports table + create-export picker |
 | GET    | `/ui/events`             | -                                             | append-only audit log (filter + pagination) |
@@ -145,7 +151,7 @@ start and persists it under `<data-dir>/session-secret`. Set it
 explicitly to keep cookies valid across a container rebuild that
 wipes the data volume, or to rotate the secret on demand.
 
-The NBD port itself is unauthenticated (nbd-server's classical model);
+The NBD port itself is unauthenticated (nbdkit's default posture);
 LAN-only assumption, firewall is the operator's responsibility.
 
 ## License

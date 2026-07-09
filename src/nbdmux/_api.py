@@ -211,7 +211,9 @@ def register_api_routes(
                 ),
             )
         format_hint = _detect_format(src_url, format_override)
-        dest = os.path.join(_get_images_dir(request.app), f"{name}.img")
+        # ``name`` already ends in ``.img`` after :func:`_derive_export_name`
+        # (see docstring). No suffix appended here.
+        dest = os.path.join(_get_images_dir(request.app), name)
         record = store.upsert_export(
             name,
             dest,
