@@ -84,11 +84,15 @@ class CreateExportFormHappyPathTests(_AdminFormsBase):
         # Name matches the URL's basename verbatim (already valid).
         listing = self.client.get("/exports").json()
         self.assertEqual(len(listing), 1)
-        self.assertEqual(listing[0]["name"], "demo.img.gz")
+        # Since v0.8 :func:`_derive_export_name` strips compression
+        # suffixes and always ends the name in ``.img`` so the export
+        # name equals the on-disk filename equals the string nbdkit's
+        # ``file dir=`` mode exposes on the wire.
+        self.assertEqual(listing[0]["name"], "demo.img")
         self.assertEqual(listing[0]["status"], "queued")
         self.assertEqual(listing[0]["src_url"], "https://upstream.invalid/demo.img.gz")
         body = self.client.get("/ui/exports").text
-        self.assertIn("demo.img.gz", body)
+        self.assertIn("demo.img", body)
 
     def test_url_with_non_allowlist_chars_is_sanitised(self) -> None:
         """Any character outside ``[A-Za-z0-9._-]`` folds to ``-`` so
@@ -101,7 +105,10 @@ class CreateExportFormHappyPathTests(_AdminFormsBase):
         )
         self.assertEqual(r.status_code, 303)
         listing = self.client.get("/exports").json()
-        self.assertEqual(listing[0]["name"], "Ubuntu-24.iso.zst")
+        # Compression suffix stripped, ``.img`` appended (see the
+        # ``.gz`` case above); ``.iso`` in the middle is preserved so
+        # the human-facing name still carries the source hint.
+        self.assertEqual(listing[0]["name"], "Ubuntu-24.iso.img")
 
 
 class CreateExportFormValidationTests(_AdminFormsBase):
@@ -166,7 +173,9 @@ class DeleteExportFormTests(_AdminFormsBase):
             data={"src_url": "https://upstream.invalid/to-delete.img.gz"},
         )
         self.assertEqual(len(self.client.get("/exports").json()), 1)
-        r = self.client.post("/admin/delete_export/to-delete.img.gz", follow_redirects=False)
+        # Derived name is ``to-delete.img`` per :func:`_derive_export_name`
+        # (v0.8 suffix policy).
+        r = self.client.post("/admin/delete_export/to-delete.img", follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertEqual(r.headers["location"], "/ui/exports")
         self.assertEqual(self.client.get("/exports").json(), [])

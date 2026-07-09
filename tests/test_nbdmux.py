@@ -7,6 +7,7 @@ without an install.
 import gzip
 import http.client
 import http.server
+import json
 import os
 import shutil
 import socketserver
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -160,18 +162,23 @@ class TestStore(unittest.TestCase):
 
 
 class TestEnsureProbeExport(unittest.TestCase):
-    """The always-on ``probe`` export gives nbd-server something to
+    """The always-on ``probe.img`` export gives nbdkit something to
     serve unconditionally (so its subprocess is always up + STOPPED
     stays a real signal) and gives operators a smoke-test target
-    (``qemu-nbd nbd://host:10809/probe`` should always answer)."""
+    (``nbdinfo nbd://host:10809/probe.img`` should always answer).
+
+    Since v0.8 the probe file lives under ``<images_dir>`` so
+    nbdkit's ``file dir=`` mode discovers it alongside real exports.
+    """
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        self.images_dir = os.path.join(self.tmpdir, "images")
         self.store = server.Store(self.tmpdir)
 
     def test_probe_file_created_and_registered(self):
-        server._ensure_probe_export(self.store, self.tmpdir)
-        probe_path = os.path.join(self.tmpdir, "probe.img")
+        server._ensure_probe_export(self.store, self.tmpdir, self.images_dir)
+        probe_path = os.path.join(self.images_dir, server.PROBE_EXPORT_NAME)
         self.assertTrue(os.path.isfile(probe_path))
         self.assertEqual(os.path.getsize(probe_path), server.PROBE_EXPORT_SIZE)
         # Banner at head so an operator dd-ing the export sees a
@@ -188,76 +195,33 @@ class TestEnsureProbeExport(unittest.TestCase):
     def test_probe_is_idempotent(self):
         """A second call must not rewrite the file (spares an IO
         round-trip on every daemon start) or duplicate the row."""
-        server._ensure_probe_export(self.store, self.tmpdir)
-        probe_path = os.path.join(self.tmpdir, "probe.img")
+        server._ensure_probe_export(self.store, self.tmpdir, self.images_dir)
+        probe_path = os.path.join(self.images_dir, server.PROBE_EXPORT_NAME)
         first_mtime = os.path.getmtime(probe_path)
         time.sleep(0.05)  # mtime resolution guard
-        server._ensure_probe_export(self.store, self.tmpdir)
+        server._ensure_probe_export(self.store, self.tmpdir, self.images_dir)
         second_mtime = os.path.getmtime(probe_path)
         self.assertEqual(first_mtime, second_mtime)
         self.assertEqual(len(self.store.list_exports()), 1)
 
     def test_probe_regenerates_when_truncated(self):
         """If someone truncated probe.img, the next daemon start must
-        rewrite it (else nbd-server would export a bad-sized file
-        that fails client reads at the tail)."""
-        server._ensure_probe_export(self.store, self.tmpdir)
-        probe_path = os.path.join(self.tmpdir, "probe.img")
+        rewrite it (else nbdkit would export a bad-sized file that
+        fails client reads at the tail)."""
+        server._ensure_probe_export(self.store, self.tmpdir, self.images_dir)
+        probe_path = os.path.join(self.images_dir, server.PROBE_EXPORT_NAME)
         with open(probe_path, "wb") as f:
             f.write(b"short")
-        server._ensure_probe_export(self.store, self.tmpdir)
+        server._ensure_probe_export(self.store, self.tmpdir, self.images_dir)
         self.assertEqual(os.path.getsize(probe_path), server.PROBE_EXPORT_SIZE)
 
 
-# --------------------------------------------------------------------------
-# NbdServer: config rendering (subprocess not actually spawned)
-# --------------------------------------------------------------------------
-class TestNbdServerConfig(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-        self.nbd = server.NbdServer(
-            data_dir=self.tmpdir, port=10809, bind="0.0.0.0", nbd_server_bin="/bin/true"
-        )
-
-    def test_render_no_exports(self):
-        body = self.nbd._render_config([])
-        self.assertIn("[generic]", body)
-        self.assertIn("port = 10809", body)
-        self.assertIn("listenaddr = 0.0.0.0", body)
-        # No export sections when nothing's registered.
-        self.assertNotIn("\n[", body[body.index("[generic]") + len("[generic]") :])
-
-    def test_render_one_readonly_export(self):
-        body = self.nbd._render_config(
-            [{"name": "debian", "file": "/var/lib/nbdmux/debian.img", "readonly": True}]
-        )
-        self.assertIn("[debian]", body)
-        self.assertIn("exportname = /var/lib/nbdmux/debian.img", body)
-        self.assertIn("readonly = true", body)
-
-    def test_render_writable_export_omits_readonly(self):
-        """``readonly = true`` only appears when readonly is asserted;
-        absence is nbd-server's writable default."""
-        body = self.nbd._render_config(
-            [{"name": "rw", "file": "/var/lib/nbdmux/rw.img", "readonly": False}]
-        )
-        self.assertIn("[rw]", body)
-        self.assertNotIn("readonly", body[body.index("[rw]") :])
-
-    def test_write_config_atomic(self):
-        self.nbd.write_config([{"name": "x", "file": "/tmp/x.img", "readonly": True}])
-        with open(self.nbd.config_path) as f:
-            self.assertIn("[x]", f.read())
-        # No leftover .tmp file
-        self.assertFalse(os.path.exists(self.nbd.config_path + ".tmp"))
-
-
-def _write_fake_nbd_bin(tmpdir: str) -> str:
+def _write_fake_nbdkit_bin(tmpdir: str) -> str:
     """Write a tiny shell script that ignores its args and blocks
-    forever (via ``exec sleep``). Lets NbdServer.start /
-    reload / stop exercise real subprocess supervision without
-    needing nbd-server on the runner."""
-    path = os.path.join(tmpdir, "fake-nbd-server")
+    forever (via ``exec sleep``). Lets ``NbdServer.start`` /
+    ``stop`` exercise real subprocess supervision without needing
+    nbdkit on the runner."""
+    path = os.path.join(tmpdir, "fake-nbdkit")
     with open(path, "w") as f:
         f.write("#!/bin/sh\nexec sleep 60\n")
     os.chmod(path, 0o755)
@@ -267,71 +231,63 @@ def _write_fake_nbd_bin(tmpdir: str) -> str:
 @unittest.skipUnless(os.path.exists("/bin/sh"), "sh not available")
 class TestNbdServerLifecycle(unittest.TestCase):
     """Exercise NbdServer's supervision surface end-to-end against a
-    fake nbd-server binary that blocks on ``sleep``. The audit noted
-    the deferred-start path (empty exports -> no subprocess) + the
-    empty-reload path (config drops to zero exports -> stop the
-    daemon) had zero coverage."""
+    fake nbdkit binary that blocks on ``sleep``.
+
+    Since v0.8 the class shrinks a lot: no INI file to render, no
+    SIGHUP-based reload, no deferred-start-on-empty-exports quirk
+    (nbdkit ``dir=`` mode runs unconditionally). ``reload()`` is a
+    documented no-op kept only for signature compat with callers.
+    """
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.fake_bin = _write_fake_nbd_bin(self.tmpdir)
+        self.images_dir = os.path.join(self.tmpdir, "images")
+        self.fake_bin = _write_fake_nbdkit_bin(self.tmpdir)
         self.nbd = server.NbdServer(
-            data_dir=self.tmpdir,
+            images_dir=self.images_dir,
             port=10809,
             bind="0.0.0.0",
-            nbd_server_bin=self.fake_bin,
+            nbdkit_bin=self.fake_bin,
         )
 
     def tearDown(self):
         self.nbd.stop()
 
-    def _one_export(self):
-        return [{"name": "demo", "file": "/tmp/demo.img", "readonly": True}]
-
-    def test_start_with_empty_exports_is_deferred(self):
-        # No exports -> config gets written, but no subprocess is
-        # spawned (nbd-server would hard-fail with 'No configured
-        # exports; quitting').
+    def test_start_with_empty_dir_still_spawns(self):
+        # nbdkit's ``file dir=`` mode is fine with an empty directory,
+        # so unlike nbd-server we don't defer the subprocess when
+        # zero exports are registered.
         self.nbd.start([])
-        self.assertFalse(self.nbd.is_running())
-        self.assertTrue(os.path.exists(self.nbd.config_path))
-
-    def test_start_with_one_export_spawns_subprocess(self):
-        self.nbd.start(self._one_export())
         self.assertTrue(self.nbd.is_running())
+        self.assertTrue(os.path.isdir(self.images_dir))
 
-    def test_reload_from_empty_starts_deferred_daemon(self):
-        # start([]) deferred it; first non-empty reload() lifts off.
+    def test_start_creates_images_dir_if_missing(self):
+        # The fixture points at a directory that doesn't exist yet.
+        self.assertFalse(os.path.isdir(self.images_dir))
         self.nbd.start([])
-        self.assertFalse(self.nbd.is_running())
-        self.nbd.reload(self._one_export())
-        self.assertTrue(self.nbd.is_running())
+        self.assertTrue(os.path.isdir(self.images_dir))
 
-    def test_reload_to_empty_stops_running_daemon(self):
-        # An empty reload() with a currently-running daemon must stop
-        # it cleanly; SIGHUP-ing an empty-INI would kill it messily.
-        self.nbd.start(self._one_export())
-        self.assertTrue(self.nbd.is_running())
+    def test_reload_is_a_noop(self):
+        # ``reload()`` is retained for signature compat with
+        # pre-v0.8 callers but does nothing. It must not blow up
+        # regardless of whether the daemon is running or not, and
+        # must not change ``is_running`` state.
         self.nbd.reload([])
         self.assertFalse(self.nbd.is_running())
-
-    def test_reload_while_empty_and_stopped_is_no_op(self):
-        # Neither the daemon nor the config had exports; a subsequent
-        # empty reload() should just rewrite the (still-empty) config
-        # and stay dormant, not crash.
         self.nbd.start([])
-        self.nbd.reload([])
-        self.assertFalse(self.nbd.is_running())
+        self.assertTrue(self.nbd.is_running())
+        self.nbd.reload([{"name": "demo.img", "file": "/tmp/demo.img"}])
+        self.assertTrue(self.nbd.is_running())
 
     def test_start_is_idempotent(self):
-        self.nbd.start(self._one_export())
+        self.nbd.start([])
         pid_before = self.nbd._proc.pid  # type: ignore[union-attr]
-        self.nbd.start(self._one_export())
+        self.nbd.start([])
         pid_after = self.nbd._proc.pid  # type: ignore[union-attr]
         self.assertEqual(pid_before, pid_after)
 
     def test_stop_transitions_running_to_not_running(self):
-        self.nbd.start(self._one_export())
+        self.nbd.start([])
         self.assertTrue(self.nbd.is_running())
         self.nbd.stop()
         self.assertFalse(self.nbd.is_running())
@@ -379,6 +335,95 @@ class TestDetectFormat(unittest.TestCase):
 
     def test_none_src_url(self):
         self.assertEqual(server._detect_format(None, None), "img")
+
+
+class TestLookupWithcacheFormat(unittest.TestCase):
+    """v0.8 catalog-lookup path. When ``NBDMUX_WITHCACHE_URL`` points
+    at a live withcache, :func:`_detect_format` consults its
+    ``/catalog`` to find an entry matching the src URL and reads the
+    entry's ``format`` field. This is the authoritative source for
+    OCI / ORAS references (whose URL suffix carries no format hint).
+    """
+
+    def setUp(self) -> None:
+        self._orig_env = os.environ.get("NBDMUX_WITHCACHE_URL")
+        os.environ["NBDMUX_WITHCACHE_URL"] = "http://wc.example.invalid"
+
+    def tearDown(self) -> None:
+        if self._orig_env is None:
+            os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        else:
+            os.environ["NBDMUX_WITHCACHE_URL"] = self._orig_env
+
+    def _mock_urlopen(self, catalog: dict) -> Any:
+        """Patch ``urllib.request.urlopen`` so tests never touch the
+        network. Returns the mock so callers can inspect calls."""
+        from unittest.mock import MagicMock, patch
+
+        payload = json.dumps(catalog).encode()
+        resp = MagicMock()
+        resp.read.return_value = payload
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return patch("urllib.request.urlopen", return_value=resp)
+
+    def test_matches_by_src_and_returns_format(self):
+        catalog = {
+            "entries": [
+                {
+                    "name": "ubuntu-2604-headless-2026.W27",
+                    "src": "oras://ghcr.io/safl/nosi/ubuntu-2604-headless:2026.W27",
+                    "format": "img.gz",
+                },
+            ]
+        }
+        with self._mock_urlopen(catalog):
+            fmt = server._lookup_withcache_format(
+                "oras://ghcr.io/safl/nosi/ubuntu-2604-headless:2026.W27"
+            )
+        self.assertEqual(fmt, "img.gz")
+
+    def test_matches_by_resolved_src(self):
+        """An ORAS src can be canonicalised to a resolved blob URL;
+        an operator may register either shape and both must match."""
+        catalog = {
+            "entries": [
+                {
+                    "src": "oras://ghcr.io/x:tag",
+                    "resolved_src": "https://ghcr.io/v2/x/blobs/sha256:aa",
+                    "format": "img.zst",
+                },
+            ]
+        }
+        with self._mock_urlopen(catalog):
+            fmt = server._lookup_withcache_format("https://ghcr.io/v2/x/blobs/sha256:aa")
+        self.assertEqual(fmt, "img.zst")
+
+    def test_no_match_returns_none(self):
+        catalog = {"entries": [{"src": "http://other/x.img", "format": "img"}]}
+        with self._mock_urlopen(catalog):
+            fmt = server._lookup_withcache_format("http://nowhere/x.img")
+        self.assertIsNone(fmt)
+
+    def test_missing_env_returns_none(self):
+        os.environ.pop("NBDMUX_WITHCACHE_URL", None)
+        # Doesn't touch the network at all with env unset.
+        self.assertIsNone(server._lookup_withcache_format("http://anything"))
+
+    def test_catalog_lookup_wins_over_url_suffix(self):
+        """Ordering contract: withcache's authoritative format field
+        overrides URL-suffix guessing, so an operator who registers
+        ``foo.img`` in withcache with ``format=img.gz`` (unusual, but
+        legal for pre-gzipped blobs served under an ``.img`` name)
+        still gets the correct decompressor."""
+        catalog = {
+            "entries": [
+                {"src": "http://h/foo.img", "format": "img.gz"},
+            ]
+        }
+        with self._mock_urlopen(catalog):
+            fmt = server._detect_format("http://h/foo.img", None)
+        self.assertEqual(fmt, "img.gz")
 
 
 class TestDecompressorCmd(unittest.TestCase):

@@ -7,11 +7,10 @@ verify /healthz returns 200 + expected JSON, verify /exports
 returns an empty list, then send SIGTERM and confirm the process
 exits cleanly.
 
-Skipped when the ``nbd-server`` binary is absent -- the Warmer
-lifecycle enqueues but does no real work in a fresh state.db, and
-NbdServer only fires the subprocess when there's at least one
-ready export; the smoke test's happy path doesn't need it. The
-Warmer thread still starts.
+Skipped when the ``nbdkit`` binary is absent. The Warmer lifecycle
+enqueues but does no real work in a fresh state.db; nbdkit runs
+unconditionally in ``file dir=`` mode so an empty images directory
+still produces a live listener. The Warmer thread still starts.
 
 This test replaces the fear-driven "did we break the daemon?"
 gap the earlier port checkpoints had. Written as
@@ -36,12 +35,12 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-# The lifespan starts NbdServer, which spawns the real nbd-server
+# The lifespan starts NbdServer, which spawns the real nbdkit
 # binary. Skip the smoke test when the binary isn't installed --
 # this test's purpose is proving uvicorn boots the daemon end to
-# end. CI installs nbd-server via ``apt-get install nbd-server``
-# in the runner setup.
-_NBD_SERVER_BIN = shutil.which("nbd-server")
+# end. CI installs nbdkit via ``apt-get install nbdkit`` in the
+# runner setup.
+_NBDKIT_BIN = shutil.which("nbdkit")
 
 
 def _find_free_port() -> int:
@@ -69,7 +68,7 @@ def _wait_for_http(url: str, *, timeout: float = 10.0) -> None:
     raise TimeoutError(f"{url!r} did not respond 200 within {timeout}s: {last_err}")
 
 
-@unittest.skipIf(_NBD_SERVER_BIN is None, "nbd-server binary not available on this runner")
+@unittest.skipIf(_NBDKIT_BIN is None, "nbdkit binary not available on this runner")
 class UvicornRuntimeSmokeTests(unittest.TestCase):
     """Boot the daemon exactly like ``server.main`` does + poke
     the wire from an external client."""
@@ -95,9 +94,9 @@ class UvicornRuntimeSmokeTests(unittest.TestCase):
     def _spawn(self) -> subprocess.Popen[bytes]:
         """Launch ``nbdmux-server`` (the pyproject.toml script that
         points at ``server:main``) with the temp data-dir + a free
-        port. The Warmer thread starts inside the lifespan; we
-        don't need nbd-server to fire since the test's happy path
-        doesn't register a ready export."""
+        port. The Warmer thread starts inside the lifespan; nbdkit
+        runs unconditionally in ``file dir=`` mode, so an empty
+        images directory still leaves us with a live listener."""
         return subprocess.Popen(
             [
                 sys.executable,
@@ -112,11 +111,10 @@ class UvicornRuntimeSmokeTests(unittest.TestCase):
                 "--nbd-port",
                 str(_find_free_port()),
                 # Point at the real binary found by shutil.which so
-                # NbdServer's Popen succeeds; the empty ready list
-                # + free NBD port keep nbd-server harmless (no NBD
-                # clients connect, no data flows).
-                "--nbd-server-bin",
-                _NBD_SERVER_BIN or "nbd-server",
+                # NbdServer's Popen succeeds. nbdkit's ``file dir=``
+                # mode is fine serving an empty directory.
+                "--nbdkit-bin",
+                _NBDKIT_BIN or "nbdkit",
             ],
             env=self._env,
             stdout=subprocess.PIPE,

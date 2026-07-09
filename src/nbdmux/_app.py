@@ -529,7 +529,11 @@ def create_app(
                 "needs a withcache upstream. Set the env var and restart."
             )
         format_hint = _detect_format(s, None)
-        dest = os.path.join(str(app.state.images_dir), f"{n}.img")
+        # Since v0.8 the export ``name`` already ends in ``.img`` (see
+        # :func:`_derive_export_name`), so the on-disk filename equals
+        # the export name equals the string nbdkit exposes via
+        # ``file dir=`` mode. No extra suffix appended here.
+        dest = os.path.join(str(app.state.images_dir), n)
         app.state.store.upsert_export(
             n,
             dest,

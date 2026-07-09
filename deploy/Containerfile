@@ -1,17 +1,24 @@
-# nbdmux container -- bundles the daemon + nbd-server + minimal Python.
+# nbdmux container -- bundles the daemon + nbdkit + minimal Python.
 #
 # Build:  podman build -t ghcr.io/safl/nbdmux:dev -f deploy/Containerfile .
 # Run:    see deploy/compose.yml for the production shape.
 #
 # Two ports:
 #   8082   HTTP control plane + operator UI
-#  10809   NBD (nbd-server)
+#  10809   NBD (nbdkit)
 
-FROM debian:trixie-slim
+# Ubuntu 26.04 for nbdkit >= 1.44, which is when the ``cow`` filter
+# became safe to combine with per-connection named exports (see the
+# "Export safe" column in the nbdkit-filter-cow(1) man page). Debian
+# trixie ships 1.42 in which the same combination silently corrupts.
+# nbdmux depends on cow-per-export to give operators writable
+# ramboot targets over read-only image blobs, so the newer nbdkit
+# is a hard requirement, not an optimization.
+FROM ubuntu:26.04
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        nbd-server \
+        nbdkit \
         python3 \
         python3-pip \
         ca-certificates \
@@ -24,13 +31,13 @@ RUN apt-get update \
 # curl: HEALTHCHECK below. curl's ``-f`` treats any 4xx/5xx as a
 # non-zero exit without dumping a Python Traceback into
 # ``podman logs`` on every probe when /healthz returns 503
-# (nbd-server down). The Python-in-CMD alternative worked but
-# spammed the logs on every failed probe.
+# (nbdkit down). The Python-in-CMD alternative worked but spammed
+# the logs on every failed probe.
 
-# gzip / zstd / xz-utils: the Warmer pipeline (v0.2.0+) pipes
-# upstream bytes through ``gunzip -c`` / ``zstd -d -c`` / ``xz -d -c``
-# while streaming into the decompressed .img on disk. gzip ships
-# baseline on trixie-slim but we pin it for clarity.
+# gzip / zstd / xz-utils: the Warmer pipeline pipes upstream bytes
+# through ``gunzip -c`` / ``zstd -d -c`` / ``xz -d -c`` while
+# streaming into the decompressed .img on disk. On Ubuntu 26.04 we
+# pin them explicitly rather than relying on the base having them.
 
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE /app/
