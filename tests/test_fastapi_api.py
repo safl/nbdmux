@@ -68,6 +68,9 @@ _EXPECTED_RECORD_KEYS = {
     "completed_at",
     "updated_at",
     "error",
+    # Added in v0.8.1 -- the port the per-export nbdkit is listening
+    # on. Null when the process isn't currently running.
+    "nbd_port",
 }
 
 

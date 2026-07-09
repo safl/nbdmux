@@ -13,13 +13,16 @@ owns the parts of the daemon that stay stdlib:
   ``set_status``. Single ``state.db`` under ``--data-dir``.
 - ``Auth``: server-signed HMAC cookie, ``NBDMUX_ADMIN_PASSWORD`` env
   gate. Signing key resolution via :func:`resolve_secret`.
-- ``NbdServer``: supervises a single nbdkit child that serves
-  ``<images_dir>`` via the ``file`` plugin's ``dir=`` mode. Each
-  regular file in the directory is exposed as an NBD export whose
-  name equals its filename. The ``cow`` filter is always applied so
-  clients see a per-connection writable overlay while the backing
-  file stays untouched. Since v0.8.0 (was ``nbd-server -d -C conf``
-  + SIGHUP reload).
+- ``NbdServer``: supervises one nbdkit child PER export. Each
+  export gets its own TCP port starting from ``--nbd-port`` and its
+  own filter chain -- ``cow`` always applied for a per-connection
+  writable overlay, plus ``partition=1`` layered on for partitioned
+  disk images so clients see the root filesystem directly on
+  ``/dev/nbd0`` (no client-side loop stack). Ports get persisted to
+  the ``exports.nbd_port`` column so the JSON API can surface them
+  to bty's iPXE renderer. Since v0.8.1 (was single-nbdkit ``dir=``
+  mode in v0.8.0; ``nbd-server -d -C conf`` + SIGHUP reload before
+  that).
 - ``Warmer``: fetch + decompress worker that walks each queued
   export through queued -> fetching -> decompressing -> ready. Fetches
   go through the configured withcache (``NBDMUX_WITHCACHE_URL``);
@@ -89,14 +92,15 @@ def _derive_export_name(src_url: str) -> str | None:
     is folded to ``-``; leading non-alnum characters are stripped;
     the result is truncated to 64 chars.
 
-    Suffix policy: names ALWAYS end in ``.img``. The Warmer decompresses
-    on the fly (see :func:`_sniff_format`), so what lands on disk is
-    always a raw disk image regardless of what the source URL's
-    extension advertised. Trailing ``.gz`` / ``.zst`` / ``.xz`` are
-    stripped, and ``.img`` is appended if not already present. The
-    export name equals the filename in the images directory
-    (``<images_dir>/<name>``), which is what nbdkit's ``file dir=``
-    mode uses to route ``NBD_OPT_INFO``.
+    Suffix policy: names ALWAYS end in ``.img``. The Warmer
+    decompresses on the fly (see :func:`_lookup_withcache_format` +
+    :func:`_fetch_and_decompress`), so what lands on disk is always
+    a raw disk image regardless of what the source URL's extension
+    advertised. Trailing ``.gz`` / ``.zst`` / ``.xz`` are stripped,
+    and ``.img`` is appended if not already present. The export
+    name equals the filename in the images directory
+    (``<images_dir>/<name>``), which is the ``file=`` argument the
+    per-export nbdkit instance is spawned with.
 
     Examples:
       https://ex/foo.img.gz               -> foo.img
@@ -263,6 +267,13 @@ CREATE TABLE IF NOT EXISTS exports (
     bytes_total    INTEGER,        -- expected response size from upstream (Content-Length)
     bytes_done     INTEGER,        -- decompressed bytes written to disk so far
     error          TEXT,           -- populated when status='failed'
+    -- TCP port this export's nbdkit instance listens on. Since v0.8
+    -- nbdmux spawns one nbdkit per export so per-export filter chains
+    -- (e.g. ``--filter=partition`` for partitioned disk images) can
+    -- differ. Populated by the NbdServer at spawn time and surfaced
+    -- through ``GET /exports`` so bty's iPXE renderer can point
+    -- ``bty.nbd=tcp://<host>:<port>`` at the right process.
+    nbd_port       INTEGER,
     enqueued_at    TEXT NOT NULL,
     started_at     TEXT,
     completed_at   TEXT,
@@ -271,7 +282,7 @@ CREATE TABLE IF NOT EXISTS exports (
 """
 
 
-_SCHEMA_VERSION = 2  # v0.2.0 adds the warming state-machine columns
+_SCHEMA_VERSION = 3  # v0.8.0 adds nbd_port column for per-export nbdkit instances
 
 
 class Store:
@@ -385,6 +396,16 @@ class Store:
             )
         return self.get_export(name) or {}
 
+    def set_nbd_port(self, name: str, port: int | None) -> None:
+        """Persist the TCP port an export's nbdkit is currently
+        listening on. Set to ``None`` when the export's nbdkit isn't
+        running (e.g. spawn failed, or between stop() and start())."""
+        with _DB_WRITE_LOCK, self.conn() as c:
+            c.execute(
+                "UPDATE exports SET nbd_port=?, updated_at=? WHERE name=?",
+                (port, now_iso(), name),
+            )
+
     def set_status(
         self,
         name: str,
@@ -457,6 +478,14 @@ def _row_to_export(row: sqlite3.Row) -> dict[str, Any]:
     progress = None
     if bytes_total and bytes_total > 0:
         progress = round(min(100.0, (bytes_done * 100.0) / bytes_total), 1)
+    # ``nbd_port`` was added in schema v3; use column-access-with-default
+    # so downstream consumers of a mid-migration DB (row exists, column
+    # missing on stale connection) don't KeyError. sqlite3.Row raises
+    # on missing keys, so we guard.
+    try:
+        nbd_port = row["nbd_port"]
+    except (IndexError, KeyError):
+        nbd_port = None
     return {
         "name": row["name"],
         "file": row["file"],
@@ -468,6 +497,7 @@ def _row_to_export(row: sqlite3.Row) -> dict[str, Any]:
         "bytes_done": bytes_done,
         "progress": progress,
         "error": row["error"],
+        "nbd_port": nbd_port,
         "enqueued_at": row["enqueued_at"],
         "started_at": row["started_at"],
         "completed_at": row["completed_at"],
@@ -872,9 +902,7 @@ class Warmer:
                 if sz - last_reported >= progress_chunk:
                     last_reported = sz
                     with contextlib.suppress(Exception):
-                        self._store.set_status(
-                            name, "decompressing", bytes_done=sz
-                        )
+                        self._store.set_status(name, "decompressing", bytes_done=sz)
 
         watcher = threading.Thread(target=_watch, daemon=True)
         watcher.start()
@@ -891,8 +919,7 @@ class Warmer:
                         err = proc.stderr.read()
                     stage = "curl" if proc is pipeline[0] else "decompressor"
                     raise RuntimeError(
-                        f"{stage} exited rc={rc}: "
-                        f"{err.decode('utf-8', errors='replace').strip()}"
+                        f"{stage} exited rc={rc}: {err.decode('utf-8', errors='replace').strip()}"
                     )
         finally:
             stop_flag.set()
@@ -929,140 +956,238 @@ def _decompressor_cmd(format_hint: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# NbdServer -- nbdkit subprocess supervision
+# NbdServer -- one nbdkit subprocess per export
 # --------------------------------------------------------------------------
+def _file_looks_partitioned(path: str) -> bool:
+    """Return True if the file at ``path`` has an MBR/GPT partition
+    table.
+
+    Checks the classic boot-sector magic ``0x55 0xAA`` at bytes 510-511.
+    That covers real MBR, protective MBR for GPT, and hybrid disks --
+    every partitioned disk image nosi (or any well-formed cloud image)
+    hands us. Non-partitioned raw filesystem blobs (nosi's default for
+    ramboot exports) don't have this signature.
+
+    Files smaller than 512 bytes, unreadable files, and files that
+    error mid-read all report False (safer default: don't apply the
+    ``partition`` filter -- if we're wrong the boot will fail on
+    mount, which is loud, rather than silently strip the disk to
+    partition 1 of a non-partitioned image).
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except OSError:
+        return False
+    return len(head) == 512 and head[510:512] == b"\x55\xaa"
+
+
+def _port_available(bind: str, port: int) -> bool:
+    """True iff ``bind:port`` is free (no other socket is listening).
+
+    Used only during port allocation. The 1 ms race between the
+    check and nbdkit's own ``bind()`` is fine: nbdkit exits loudly
+    on bind failure and ``NbdServer.spawn_export`` reports the
+    error to the caller.
+    """
+    import socket as _socket
+
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        s.bind((bind, port))
+    except OSError:
+        return False
+    else:
+        return True
+    finally:
+        with contextlib.suppress(OSError):
+            s.close()
+
+
 class NbdServer:
-    """Manages the nbdkit child that serves the images directory.
+    """Manages one nbdkit child per export.
 
-    nbdkit (``libguestfs.org/nbdkit``) is invoked once with the
-    ``file`` plugin in ``dir=`` mode. Each regular file in
-    ``images_dir`` is served as an NBD export whose name matches the
-    file's basename -- so a ``POST /exports`` that lands
-    ``<images_dir>/<name>.img`` on disk becomes NBD export
-    ``<name>.img`` on the wire without any per-export bookkeeping in
-    the server config. That means no config file, no SIGHUP reload
-    dance, and no risk of a stale INI wedging the subprocess (the
-    pain we hit repeatedly on nbd-server <=0.7).
+    Each export gets its own nbdkit process on its own TCP port,
+    with a filter chain tuned to that export's on-disk shape. That
+    lets partitioned images use ``--filter=partition partition=1``
+    (which is "Export safe: No" and therefore incompatible with
+    ``dir=``-mode multi-export) alongside raw-filesystem images
+    served through plain ``file file=...``. The ``cow`` filter is
+    always applied so ramboot targets get a writable view without
+    mutating the backing image.
 
-    The ``cow`` filter is always applied. It transforms every export
-    into copy-on-write: writes from a client are captured in a
-    per-connection in-memory diff, the backing file is never
-    modified, and reads that don't hit modified blocks pass through
-    to the original bytes. This lets ramboot targets mount
-    filesystems read-write without ever mutating the operator's
-    shared image blob. ``cow`` is documented as "Export safe? Yes,
-    since 1.44", which is why the container base ships nbdkit
-    >= 1.46 (see ``deploy/Containerfile``).
+    Port allocation: :attr:`port_base` is the first port scanned;
+    subsequent exports take the next free port. The assigned port
+    is persisted on the export row (``exports.nbd_port`` column) so
+    ``GET /exports`` surfaces it to bty's iPXE renderer.
 
-    :meth:`reload` is intentionally a no-op: ``dir=`` mode
-    re-enumerates the directory on each client connect, so any file
-    the Warmer just landed appears the next time nbd-client hits the
-    port. Callers still invoke ``reload()`` after mutations for
-    forward-compat + testability; the method exists on the class so
-    signatures stay stable but does nothing beyond a lock touch.
+    Lifecycle: :meth:`start` spawns nbdkit for every ready export
+    passed in. :meth:`reload` diff'-syncs against the current DB
+    (spawns new-ready exports, terminates rows that dropped out of
+    ``ready``). :meth:`stop` kills everything.
+
+    Since nbdkit >= 1.44, the ``cow`` filter is safe under
+    multi-export -- but that only matters if we used ``dir=`` mode.
+    Here we're single-file per instance, so the compatibility is
+    automatic.
     """
 
     def __init__(
         self,
         images_dir: str,
-        port: int,
+        port_base: int,
         bind: str,
+        store: Store | None = None,
         nbdkit_bin: str = "nbdkit",
-        pid_file: str | None = None,
     ):
         self.images_dir = images_dir
-        self.pid_file = pid_file
-        self.port = port
+        self.port_base = port_base
         self.bind = bind
         self.bin = nbdkit_bin
-        self._proc: subprocess.Popen[bytes] | None = None
+        # Kept optional so tests + tools that don't need port
+        # persistence can construct without a Store.
+        self._store = store
+        self._procs: dict[str, subprocess.Popen[bytes]] = {}
+        self._ports: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def start(self, exports: list[dict[str, Any]]) -> None:
-        """Spawn nbdkit in foreground mode.
-
-        Idempotent. ``exports`` is accepted for signature compat with
-        the pre-v0.8 nbd-server driver but ignored: ``dir=`` mode
-        auto-discovers what's on disk. The images directory is
-        created if missing so a first-run empty deploy still gets
-        a running listener.
-        """
+        """Spawn one nbdkit per ready export. Idempotent."""
+        os.makedirs(self.images_dir, exist_ok=True)
         with self._lock:
-            if self._proc and self._proc.poll() is None:
-                return
-            os.makedirs(self.images_dir, exist_ok=True)
-            self._spawn()
+            for e in exports:
+                self._spawn_export_locked(e)
 
     def reload(self, exports: list[dict[str, Any]]) -> None:
-        """No-op under nbdkit ``dir=`` mode; see the class docstring.
-
-        Kept on the class so pre-v0.8 callers (Warmer, JSON API
-        mutation routes, the FastAPI create-export handler) can keep
-        their invocation shape. Removing the calls entirely would
-        make it harder to swap this class in tests with a fake that
-        counts reload invocations.
-        """
+        """Diff-sync running nbdkit set against the desired export
+        list. Spawns any export in ``exports`` we're not currently
+        serving; terminates any nbdkit whose name isn't in
+        ``exports``. Order-independent."""
+        desired = {e["name"]: e for e in exports}
         with self._lock:
-            # Deliberately empty. Left as an explicit block so future
-            # code that grows a genuine reload need doesn't have to
-            # reshape callers.
-            _ = exports
+            # Kill exports we're no longer supposed to serve.
+            for name in list(self._procs):
+                if name not in desired:
+                    self._terminate_export_locked(name)
+            # Spawn or leave-alone every desired export. Iterate
+            # values() -- the dict key is redundant with export["name"].
+            for export in desired.values():
+                self._spawn_export_locked(export)
 
-    def _spawn(self) -> None:
-        """Launch the nbdkit subprocess. Caller holds ``self._lock``.
+    def stop(self) -> None:
+        with self._lock:
+            for name in list(self._procs):
+                self._terminate_export_locked(name)
 
-        Args passed:
-          -p / --ipaddr           external TCP listen (10809 by default)
-          -f                      foreground so we supervise via poll()
-          -P                      pidfile for external readers
-          --newstyle              modern NBD protocol (multi-export)
-          --filter=cow            per-connection writable overlay
-          file dir=<images_dir>   auto-discover exports by filename
+    def is_running(self) -> bool:
+        """Any live nbdkit at all? Used by ``/healthz``-style checks."""
+        with self._lock:
+            return any(p and p.poll() is None for p in self._procs.values())
+
+    def port_for(self, name: str) -> int | None:
+        """Return the port the named export's nbdkit is listening on,
+        or ``None`` if that export isn't currently running."""
+        with self._lock:
+            return self._ports.get(name)
+
+    def _spawn_export_locked(self, export: dict[str, Any]) -> None:
+        """Spawn one nbdkit for ``export`` on the next free port.
+
+        Idempotent per name: if the nbdkit for this name is already
+        alive, no-op. If it exited (poll() != None), respawn.
         """
+        name = export["name"]
+        path = export["file"]
+        # Idempotence check.
+        existing = self._procs.get(name)
+        if existing is not None and existing.poll() is None:
+            return
+        # Reap dead entry so port is freed for reuse.
+        if existing is not None:
+            self._procs.pop(name, None)
+            self._ports.pop(name, None)
+
+        port = self._allocate_port_locked()
         argv: list[str] = [
             self.bin,
             "-p",
-            str(self.port),
+            str(port),
             "--ipaddr",
             self.bind,
             "-f",
             "--newstyle",
+            "-e",
+            name,
             "--filter=cow",
         ]
-        if self.pid_file:
-            argv.extend(["-P", self.pid_file])
-        argv.extend(["file", f"dir={self.images_dir}"])
-        self._proc = subprocess.Popen(
+        # ``partition`` filter must sit BELOW ``cow`` so writes from
+        # the client land in the cow overlay, not in a partition-
+        # filter-managed slice of the backing. Filters chain top-down
+        # in the order they appear on the command line, so listing
+        # ``--filter=partition`` AFTER ``--filter=cow`` puts it
+        # nearer the plugin (correct semantics for "cow overlays
+        # the partition view").
+        partitioned = _file_looks_partitioned(path)
+        if partitioned:
+            argv.append("--filter=partition")
+        # Plugin + its params ALWAYS come last. nbdkit's arg parser
+        # treats the first non-flag token as the plugin name and
+        # everything after as ``KEY=VALUE`` plugin params (which the
+        # partition filter also consumes). Putting ``partition=1``
+        # anywhere before ``file`` makes nbdkit try to load it as a
+        # plugin ("cannot open plugin 'partition=1'").
+        argv.extend(["file", f"file={path}"])
+        if partitioned:
+            argv.append("partition=1")
+
+        proc = subprocess.Popen(
             argv,
-            stdout=sys.stderr,  # mingle with nbdmux's own logs
+            stdout=sys.stderr,
             stderr=sys.stderr,
         )
-        # Give the child a moment to bind the port or fail loudly.
+        # Give the child a moment to bind or fail loudly.
         time.sleep(0.2)
-        if self._proc.poll() is not None:
-            rc = self._proc.returncode
-            self._proc = None
+        if proc.poll() is not None:
+            rc = proc.returncode
             raise RuntimeError(
-                f"nbdkit exited immediately (rc={rc}); "
-                f"check {self.images_dir} exists and that the binary is installed"
+                f"nbdkit for export {name!r} exited immediately "
+                f"(rc={rc}, port={port}, file={path}); "
+                "check the binary + file exist and the port is free"
             )
+        self._procs[name] = proc
+        self._ports[name] = port
+        # Persist the assigned port so the JSON API + iPXE renderer
+        # see it. Best-effort: a store write failure shouldn't kill
+        # the export (the process is up either way).
+        if self._store is not None:
+            with contextlib.suppress(Exception):
+                self._store.set_nbd_port(name, port)
 
-    def _terminate_proc_locked(self) -> None:
-        """Stop the subprocess; caller holds ``self._lock``."""
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+    def _allocate_port_locked(self) -> int:
+        """Return the next free port at or above :attr:`port_base`
+        that isn't already claimed by a running nbdkit here or by
+        another process on the host."""
+        used = set(self._ports.values())
+        # Scan a healthy range; ports are 16-bit, don't wander far.
+        for p in range(self.port_base, self.port_base + 256):
+            if p in used:
+                continue
+            if _port_available(self.bind, p):
+                return p
+        raise RuntimeError(f"no free TCP port in range {self.port_base}..{self.port_base + 256}")
+
+    def _terminate_export_locked(self, name: str) -> None:
+        proc = self._procs.pop(name, None)
+        self._ports.pop(name, None)
+        if proc and proc.poll() is None:
+            proc.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired):
-                self._proc.wait(timeout=3)
-            if self._proc.poll() is None:
-                self._proc.kill()
-        self._proc = None
-
-    def stop(self) -> None:
-        with self._lock:
-            self._terminate_proc_locked()
-
-    def is_running(self) -> bool:
-        return bool(self._proc and self._proc.poll() is None)
+                proc.wait(timeout=3)
+            if proc.poll() is None:
+                proc.kill()
+        if self._store is not None:
+            with contextlib.suppress(Exception):
+                self._store.set_nbd_port(name, None)
 
 
 PROBE_EXPORT_NAME = "probe.img"
@@ -1198,8 +1323,9 @@ def main() -> int:
     _ensure_probe_export(store, data_dir, images_dir)
     nbd = NbdServer(
         images_dir=images_dir,
-        port=args.nbd_port,
+        port_base=args.nbd_port,
         bind=args.bind,
+        store=store,
         nbdkit_bin=args.nbdkit_bin,
     )
     warmer = Warmer(store=store, nbd=nbd, images_dir=images_dir)
@@ -1216,7 +1342,7 @@ def main() -> int:
 
     print(
         f"nbdmux: HTTP http://{args.bind}:{args.port}/ "
-        f"NBD tcp://{args.bind}:{args.nbd_port}/ "
+        f"NBD tcp://{args.bind}:{args.nbd_port}+/ (base port; per-export nbdkit) "
         f"data={data_dir} images={images_dir}",
         file=sys.stderr,
         flush=True,

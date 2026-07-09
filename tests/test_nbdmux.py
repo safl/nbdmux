@@ -228,69 +228,103 @@ def _write_fake_nbdkit_bin(tmpdir: str) -> str:
     return path
 
 
+def _write_export_file(images_dir: str, name: str, size: int = 4096) -> dict:
+    """Create a small placeholder file so ``NbdServer._spawn_export``
+    doesn't error on stat. Returns the export-row dict the tests
+    can pass to start()/reload()."""
+    os.makedirs(images_dir, exist_ok=True)
+    path = os.path.join(images_dir, name)
+    with open(path, "wb") as f:
+        f.write(b"\x00" * size)
+    return {"name": name, "file": path}
+
+
 @unittest.skipUnless(os.path.exists("/bin/sh"), "sh not available")
 class TestNbdServerLifecycle(unittest.TestCase):
-    """Exercise NbdServer's supervision surface end-to-end against a
-    fake nbdkit binary that blocks on ``sleep``.
-
-    Since v0.8 the class shrinks a lot: no INI file to render, no
-    SIGHUP-based reload, no deferred-start-on-empty-exports quirk
-    (nbdkit ``dir=`` mode runs unconditionally). ``reload()`` is a
-    documented no-op kept only for signature compat with callers.
-    """
+    """Exercise NbdServer's per-export supervision against a fake
+    nbdkit binary that blocks on ``sleep`` -- no real nbdkit needed
+    on the runner. Since v0.8.1 nbdmux spawns one nbdkit per export
+    so per-export filter chains (partition, etc.) can differ; the
+    tests exercise the multi-process dict lifecycle."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.images_dir = os.path.join(self.tmpdir, "images")
         self.fake_bin = _write_fake_nbdkit_bin(self.tmpdir)
+        self.store = server.Store(self.tmpdir)
         self.nbd = server.NbdServer(
             images_dir=self.images_dir,
-            port=10809,
-            bind="0.0.0.0",
+            port_base=20809,  # off the default so parallel test runs don't collide
+            bind="127.0.0.1",
+            store=self.store,
             nbdkit_bin=self.fake_bin,
         )
 
     def tearDown(self):
         self.nbd.stop()
 
-    def test_start_with_empty_dir_still_spawns(self):
-        # nbdkit's ``file dir=`` mode is fine with an empty directory,
-        # so unlike nbd-server we don't defer the subprocess when
-        # zero exports are registered.
+    def test_start_with_empty_export_list_does_nothing(self):
+        # No exports -> no nbdkit spawned. Empty state is fine.
         self.nbd.start([])
-        self.assertTrue(self.nbd.is_running())
+        self.assertFalse(self.nbd.is_running())
+        # Still creates the images dir so first-run deploys don't
+        # trip on a missing bind mount.
         self.assertTrue(os.path.isdir(self.images_dir))
 
     def test_start_creates_images_dir_if_missing(self):
-        # The fixture points at a directory that doesn't exist yet.
         self.assertFalse(os.path.isdir(self.images_dir))
         self.nbd.start([])
         self.assertTrue(os.path.isdir(self.images_dir))
 
-    def test_reload_is_a_noop(self):
-        # ``reload()`` is retained for signature compat with
-        # pre-v0.8 callers but does nothing. It must not blow up
-        # regardless of whether the daemon is running or not, and
-        # must not change ``is_running`` state.
-        self.nbd.reload([])
-        self.assertFalse(self.nbd.is_running())
-        self.nbd.start([])
+    def test_start_spawns_one_nbdkit_per_export(self):
+        e1 = _write_export_file(self.images_dir, "one.img")
+        e2 = _write_export_file(self.images_dir, "two.img")
+        # In prod the Warmer upserts the row before ``reload`` fires,
+        # so ``set_nbd_port`` finds a row to UPDATE. Mirror that here.
+        self.store.upsert_export("one.img", e1["file"])
+        self.store.upsert_export("two.img", e2["file"])
+        self.nbd.start([e1, e2])
         self.assertTrue(self.nbd.is_running())
-        self.nbd.reload([{"name": "demo.img", "file": "/tmp/demo.img"}])
-        self.assertTrue(self.nbd.is_running())
+        p1 = self.nbd.port_for("one.img")
+        p2 = self.nbd.port_for("two.img")
+        self.assertIsNotNone(p1)
+        self.assertIsNotNone(p2)
+        self.assertNotEqual(p1, p2)  # each gets its own port
+        # ``exports.nbd_port`` populated for both rows so the JSON
+        # API can surface it to bty.
+        self.assertEqual(self.store.get_export("one.img")["nbd_port"], p1)  # type: ignore[index]
+        self.assertEqual(self.store.get_export("two.img")["nbd_port"], p2)  # type: ignore[index]
+
+    def test_reload_diffs_spawns_and_terminates(self):
+        e1 = _write_export_file(self.images_dir, "keep.img")
+        e2 = _write_export_file(self.images_dir, "drop.img")
+        self.nbd.start([e1, e2])
+        self.assertIsNotNone(self.nbd.port_for("drop.img"))
+        # Reload with a shortened set -- ``drop.img`` must be stopped.
+        self.nbd.reload([e1])
+        self.assertIsNotNone(self.nbd.port_for("keep.img"))
+        self.assertIsNone(self.nbd.port_for("drop.img"))
+        # And a fresh export added by reload starts up.
+        e3 = _write_export_file(self.images_dir, "new.img")
+        self.nbd.reload([e1, e3])
+        self.assertIsNotNone(self.nbd.port_for("new.img"))
 
     def test_start_is_idempotent(self):
-        self.nbd.start([])
-        pid_before = self.nbd._proc.pid  # type: ignore[union-attr]
-        self.nbd.start([])
-        pid_after = self.nbd._proc.pid  # type: ignore[union-attr]
+        e = _write_export_file(self.images_dir, "demo.img")
+        self.nbd.start([e])
+        proc_before = self.nbd._procs["demo.img"]  # type: ignore[attr-defined]
+        pid_before = proc_before.pid
+        self.nbd.start([e])
+        pid_after = self.nbd._procs["demo.img"].pid  # type: ignore[attr-defined]
         self.assertEqual(pid_before, pid_after)
 
     def test_stop_transitions_running_to_not_running(self):
-        self.nbd.start([])
+        e = _write_export_file(self.images_dir, "demo.img")
+        self.nbd.start([e])
         self.assertTrue(self.nbd.is_running())
         self.nbd.stop()
         self.assertFalse(self.nbd.is_running())
+        self.assertIsNone(self.nbd.port_for("demo.img"))
 
 
 # --------------------------------------------------------------------------
