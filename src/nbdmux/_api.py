@@ -36,9 +36,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-from .server import Auth, _detect_format, _valid_export_name
+from .server import (
+    Auth,
+    _detect_format,
+    _lookup_withcache_entry_for_src,
+    _valid_export_name,
+)
 
 
 class _StoreProto:
@@ -90,6 +95,9 @@ def register_api_routes(
     def _get_images_dir(app_: FastAPI) -> str:
         return str(app_.state.images_dir)
 
+    def _get_artifacts_dir(app_: FastAPI) -> str:
+        return str(app_.state.artifacts_dir)
+
     def control_authed(request: Request) -> None:
         """Auth dependency for the mutation routes.
 
@@ -125,8 +133,84 @@ def register_api_routes(
         route: bty polls this from a sibling container without a
         session. No pagination -- the export set is small (dozens
         at most) and consumers scan the full list to find one by
-        name."""
-        return _get_store(request.app).list_exports()
+        name.
+
+        Each record includes ``netboot_ref`` (the sibling catalog
+        entry that carries the matching kernel+initrd bundle, or
+        ``None``) and ``netboot_ready`` (a bool derived from the
+        artifacts-dir filesystem: True iff
+        ``<artifacts_dir>/<name>/manifest.json`` exists). The
+        artifact bytes are served at ``GET /artifacts/{name}/...``.
+        """
+        artifacts_dir = _get_artifacts_dir(request.app)
+        records = _get_store(request.app).list_exports()
+        for rec in records:
+            manifest_path = os.path.join(artifacts_dir, rec.get("name", ""), "manifest.json")
+            rec["netboot_ready"] = os.path.isfile(manifest_path)
+        return records
+
+    # ---------- GET /artifacts/{name}/... (open, no auth) -----------------
+    #
+    # Netboot bundles the Warmer extracts under
+    # ``<artifacts_dir>/<name>/``. Open routes: bty's ipxe_ramboot
+    # chain references them from a target's iPXE, and target-side
+    # iPXE has no session state. LAN-only trust model matches the
+    # ``GET /exports`` / ``GET /b/<url>/<name>`` shape.
+
+    def _artifact_path(app_: FastAPI, name: str, filename: str) -> str:
+        """Resolve + validate an artifact file path.
+
+        Rejects names that fail the export-name validator (same
+        sanity check as elsewhere in the module) and refuses to
+        serve anything outside the artifacts dir (via realpath
+        containment). 404 on missing files."""
+        if not _valid_export_name(name):
+            raise HTTPException(status_code=404, detail=f"no artifact for {name!r}")
+        base = os.path.realpath(_get_artifacts_dir(app_))
+        target = os.path.realpath(os.path.join(base, name, filename))
+        if not target.startswith(base + os.sep):
+            raise HTTPException(status_code=404, detail="artifact path escapes root")
+        if not os.path.isfile(target):
+            raise HTTPException(
+                status_code=404,
+                detail=f"artifact {filename!r} not ready for export {name!r}",
+            )
+        return target
+
+    @app.get("/artifacts/{name}/vmlinuz", response_model=None)
+    def get_artifact_vmlinuz(name: str, request: Request) -> FileResponse:
+        """Serve the extracted kernel for ``name``. iPXE fetches this
+        as the ``kernel`` line target. Content-type is
+        ``application/octet-stream`` -- iPXE treats it as a raw kernel
+        image regardless."""
+        return FileResponse(
+            _artifact_path(request.app, name, "vmlinuz"),
+            media_type="application/octet-stream",
+            filename="vmlinuz",
+        )
+
+    @app.get("/artifacts/{name}/initrd", response_model=None)
+    def get_artifact_initrd(name: str, request: Request) -> FileResponse:
+        """Serve the extracted initrd for ``name``. iPXE fetches this
+        as one of the ``initrd`` lines (chain-able with additional
+        cpios if the ramboot template layers them)."""
+        return FileResponse(
+            _artifact_path(request.app, name, "initrd"),
+            media_type="application/octet-stream",
+            filename="initrd",
+        )
+
+    @app.get("/artifacts/{name}/manifest.json", response_model=None)
+    def get_artifact_manifest(name: str, request: Request) -> FileResponse:
+        """Serve the extracted manifest.json for ``name``. Consumers
+        (bty's dashboard, operator curl) can read the kernel version
+        + sha256s from here to correlate with the sibling disk-image
+        catalog entry."""
+        return FileResponse(
+            _artifact_path(request.app, name, "manifest.json"),
+            media_type="application/json",
+            filename="manifest.json",
+        )
 
     @app.get("/export/{name}", response_model=None)
     def get_export(name: str, request: Request) -> dict[str, Any]:
@@ -211,6 +295,18 @@ def register_api_routes(
                 ),
             )
         format_hint = _detect_format(src_url, format_override)
+        # Capture netboot_ref onto the row at register time so the
+        # Warmer's post-ready stage does not need to re-hit withcache
+        # (and so a later ``GET /exports`` advertises the pairing even
+        # if withcache is briefly unreachable). None when the sibling
+        # catalog entry has no netboot pairing or when withcache is
+        # unreachable at this moment.
+        withcache_entry = _lookup_withcache_entry_for_src(src_url)
+        netboot_ref = None
+        if withcache_entry is not None:
+            candidate = withcache_entry.get("netboot_ref")
+            if isinstance(candidate, str) and candidate.strip():
+                netboot_ref = candidate.strip()
         # ``name`` already ends in ``.img`` after :func:`_derive_export_name`
         # (see docstring). No suffix appended here.
         dest = os.path.join(_get_images_dir(request.app), name)
@@ -221,6 +317,7 @@ def register_api_routes(
             status="queued",
             src_url=src_url,
             format=format_hint,
+            netboot_ref=netboot_ref,
         )
         _get_warmer(request.app).enqueue(name)
         return JSONResponse(status_code=200, content=record)
@@ -240,7 +337,14 @@ def register_api_routes(
         on-disk .img so the images-dir doesn't accumulate stale
         content. Pre-warmed exports (rows without ``src_url``) leave
         the file alone -- the operator put it there, we don't own it.
+
+        Any extracted netboot bundle for the export
+        (``<artifacts_dir>/<name>/``) is removed too -- kept in
+        lockstep with the export lifecycle so a re-warmed export
+        doesn't inherit stale kernel/initrd files.
         """
+        import shutil as _shutil
+
         store = _get_store(request.app)
         nbd = _get_nbd(request.app)
 
@@ -256,5 +360,8 @@ def register_api_routes(
                 with contextlib.suppress(FileNotFoundError, OSError):
                     Path(path).unlink()
         if existed:
+            artifacts_target = os.path.join(_get_artifacts_dir(request.app), name)
+            with contextlib.suppress(FileNotFoundError, OSError):
+                _shutil.rmtree(artifacts_target)
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         return Response(status_code=status.HTTP_404_NOT_FOUND)

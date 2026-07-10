@@ -52,6 +52,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -274,6 +275,15 @@ CREATE TABLE IF NOT EXISTS exports (
     -- through ``GET /exports`` so bty's iPXE renderer can point
     -- ``bty.nbd=tcp://<host>:<port>`` at the right process.
     nbd_port       INTEGER,
+    -- Optional sibling catalog entry (looked up on withcache) whose
+    -- bytes are a nosi netboot bundle (vmlinuz + initrd +
+    -- manifest.json). NULL for exports whose upstream catalog entry
+    -- has no netboot_ref (e.g. legacy disk images, or the probe
+    -- export). Populated at register time from the withcache catalog
+    -- lookup so subsequent ``list_exports`` calls do not need a
+    -- network hop to advertise the pairing. See the Warmer's
+    -- ``_fetch_netboot_bundle`` stage for the extract + serve story.
+    netboot_ref    TEXT,
     enqueued_at    TEXT NOT NULL,
     started_at     TEXT,
     completed_at   TEXT,
@@ -282,7 +292,7 @@ CREATE TABLE IF NOT EXISTS exports (
 """
 
 
-_SCHEMA_VERSION = 3  # v0.8.0 adds nbd_port column for per-export nbdkit instances
+_SCHEMA_VERSION = 4  # v0.9.0 adds netboot_ref column for the artifact-serving stage
 
 
 class Store:
@@ -360,25 +370,35 @@ class Store:
         src_url: str | None = None,
         format: str | None = None,
         bytes_total: int | None = None,
+        netboot_ref: str | None = None,
     ) -> dict[str, Any]:
         """Insert a new export or refresh an existing one.
 
         Default status is ``ready`` so a pre-warmed-file POST (no
         ``src_url``) lands directly servable. The Warmer flips the
         status through the state machine when ``src_url`` is set.
+
+        ``netboot_ref`` names the sibling catalog entry (on withcache)
+        that carries a matching nosi netboot bundle. When set, the
+        Warmer's post-ready stage fetches the bundle and extracts it
+        under ``<artifacts_dir>/<name>/`` so bty's ipxe_ramboot chain
+        can serve the image's own kernel + initrd. Leave ``None`` for
+        pre-populated exports or disk images whose catalog entry has
+        no netboot pairing.
         """
         now = now_iso()
         with _DB_WRITE_LOCK, self.conn() as c:
             c.execute(
                 "INSERT INTO exports "
                 "(name, file, readonly, status, src_url, format, "
-                "bytes_total, bytes_done, enqueued_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?) "
+                "bytes_total, bytes_done, netboot_ref, enqueued_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET "
                 "file=excluded.file, readonly=excluded.readonly, "
                 "status=excluded.status, src_url=excluded.src_url, "
                 "format=excluded.format, bytes_total=excluded.bytes_total, "
                 "bytes_done=0, error=NULL, started_at=NULL, "
+                "netboot_ref=excluded.netboot_ref, "
                 "completed_at=CASE WHEN excluded.status='ready' "
                 "THEN excluded.enqueued_at ELSE NULL END, "
                 "updated_at=excluded.updated_at",
@@ -390,6 +410,7 @@ class Store:
                     src_url,
                     format,
                     bytes_total,
+                    netboot_ref,
                     now,
                     now,
                 ),
@@ -486,6 +507,12 @@ def _row_to_export(row: sqlite3.Row) -> dict[str, Any]:
         nbd_port = row["nbd_port"]
     except (IndexError, KeyError):
         nbd_port = None
+    # ``netboot_ref`` was added in schema v4; guarded the same way as
+    # ``nbd_port`` for the mid-migration case.
+    try:
+        netboot_ref = row["netboot_ref"]
+    except (IndexError, KeyError):
+        netboot_ref = None
     return {
         "name": row["name"],
         "file": row["file"],
@@ -498,6 +525,7 @@ def _row_to_export(row: sqlite3.Row) -> dict[str, Any]:
         "progress": progress,
         "error": row["error"],
         "nbd_port": nbd_port,
+        "netboot_ref": netboot_ref,
         "enqueued_at": row["enqueued_at"],
         "started_at": row["started_at"],
         "completed_at": row["completed_at"],
@@ -508,6 +536,60 @@ def _row_to_export(row: sqlite3.Row) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # Warmer -- async fetch + decompress pipeline (one ref at a time)
 # --------------------------------------------------------------------------
+def _fetch_withcache_catalog() -> list[dict[str, Any]]:
+    """Return the current withcache catalog entries, or ``[]`` on any
+    failure. Best-effort: a down/misconfigured withcache means the
+    caller falls back to safe defaults (no-op, or URL-suffix
+    detection). Shared by the format-hint + netboot_ref lookups so
+    both make ONE catalog fetch each rather than opening two
+    connections."""
+    import urllib.request
+
+    base = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip().rstrip("/")
+    if not base:
+        return []
+    try:
+        with urllib.request.urlopen(  # noqa: S310
+            f"{base}/catalog", timeout=3.0
+        ) as resp:
+            body = json.loads(resp.read())
+    except Exception:  # noqa: BLE001
+        return []
+    entries = body.get("entries") or []
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _lookup_withcache_entry_for_src(src_url: str) -> dict[str, Any] | None:
+    """Return the catalog entry whose ``src`` or ``resolved_src``
+    matches ``src_url``, or ``None`` if no such entry exists / the
+    catalog is unreachable. Nbdmux uses this at export-register time
+    to capture ``netboot_ref`` onto the row so subsequent bookkeeping
+    (Warmer stages, dashboard rows, ``GET /exports``) does not need
+    to re-hit withcache.
+    """
+    if not src_url:
+        return None
+    for e in _fetch_withcache_catalog():
+        if e.get("src") == src_url or e.get("resolved_src") == src_url:
+            return e
+    return None
+
+
+def _lookup_withcache_entry_by_name(name: str) -> dict[str, Any] | None:
+    """Return the catalog entry whose ``name`` matches, or ``None``.
+    Used to resolve the sibling ``netboot_ref`` entry (whose bytes
+    are the vmlinuz + initrd + manifest tarball) at Warmer time.
+    """
+    if not name:
+        return None
+    for e in _fetch_withcache_catalog():
+        if e.get("name") == name:
+            return e
+    return None
+
+
 def _lookup_withcache_format(src_url: str) -> str | None:
     """Return the ``format`` withcache has recorded for ``src_url``.
 
@@ -533,27 +615,12 @@ def _lookup_withcache_format(src_url: str) -> str | None:
     doesn't have to know which shape withcache canonicalised for a
     given entry.
     """
-    import urllib.request
-
-    base = (os.environ.get("NBDMUX_WITHCACHE_URL") or "").strip().rstrip("/")
-    if not base or not src_url:
+    entry = _lookup_withcache_entry_for_src(src_url)
+    if entry is None:
         return None
-    try:
-        with urllib.request.urlopen(  # noqa: S310
-            f"{base}/catalog", timeout=3.0
-        ) as resp:
-            body = json.loads(resp.read())
-    except Exception:  # noqa: BLE001
-        # Best-effort lookup: withcache down / catalog empty / malformed
-        # response all collapse to "no answer", callers fall back.
-        return None
-    entries = body.get("entries") or []
-    for e in entries:
-        if e.get("src") == src_url or e.get("resolved_src") == src_url:
-            fmt = e.get("format")
-            if isinstance(fmt, str) and fmt:
-                return fmt.lower()
-            return None
+    fmt = entry.get("format")
+    if isinstance(fmt, str) and fmt:
+        return fmt.lower()
     return None
 
 
@@ -662,10 +729,17 @@ class Warmer:
     Re-enqueuing a ``failed`` ref restarts at ``queued``.
     """
 
-    def __init__(self, store: Store, nbd: NbdServer, images_dir: str):
+    def __init__(
+        self,
+        store: Store,
+        nbd: NbdServer,
+        images_dir: str,
+        artifacts_dir: str,
+    ):
         self._store = store
         self._nbd = nbd
         self._images_dir = images_dir
+        self._artifacts_dir = artifacts_dir
         self._queue: list[str] = []
         self._cv = threading.Condition()
         self._thread: threading.Thread | None = None
@@ -675,6 +749,7 @@ class Warmer:
         if self._thread is not None:
             return
         os.makedirs(self._images_dir, exist_ok=True)
+        os.makedirs(self._artifacts_dir, exist_ok=True)
         self._thread = threading.Thread(target=self._run, name="nbdmux-warmer", daemon=True)
         self._thread.start()
 
@@ -807,6 +882,161 @@ class Warmer:
         )
         # Make the new ready row visible to nbd-server.
         self._nbd.reload(self._store.list_ready_exports())
+
+        # Post-ready: if this export carries a ``netboot_ref``,
+        # fetch + extract the sibling bundle into
+        # ``<artifacts_dir>/<name>/`` so bty can serve vmlinuz +
+        # initrd alongside the NBD export. Best-effort: a bundle-fetch
+        # failure logs an event but leaves the export in ``ready``
+        # (the NBD bytes path is still usable, the ramboot chain
+        # falls back to bty-media). The bundle stage does NOT flip
+        # the export status because a disk-image warm succeeded from
+        # the operator's point of view; the bundle is a bonus.
+        row = self._store.get_export(name)
+        netboot_ref = (row or {}).get("netboot_ref")
+        if netboot_ref:
+            self._fetch_netboot_bundle(name, netboot_ref)
+
+    def _fetch_netboot_bundle(self, name: str, netboot_ref: str) -> None:
+        """Fetch the sibling catalog entry's bytes and extract into
+        ``<artifacts_dir>/<name>/``. The sibling is expected to be a
+        gzipped tarball (``format=tar.gz``) built by nosi CI's
+        ``netboot_bundle_pack``, carrying at least ``vmlinuz``,
+        ``initrd``, and ``manifest.json``.
+
+        Failure modes (all logged, none fatal):
+        - Sibling entry not in withcache's catalog (operator forgot
+          to add the ``-netboot`` entry, or withcache is unreachable).
+        - Sibling entry present but not yet downloaded on withcache
+          (``list_catalog`` filters to downloaded, so ``entry is None``
+          is the observable signal).
+        - Fetch / decompress / extract failure.
+
+        On success the export's ``<artifacts_dir>/<name>/`` directory
+        contains the bundle files atomically -- extraction happens
+        into a ``.tmp`` dir that is ``os.rename``d over the target so
+        a partial fetch never leaves an inconsistent view.
+        """
+        from . import _events_log
+
+        sibling = _lookup_withcache_entry_by_name(netboot_ref)
+        if sibling is None:
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.netboot.missing_sibling",
+                summary=f"Netboot bundle sibling {netboot_ref!r} not in catalog",
+                subject_id=name,
+                details={"netboot_ref": netboot_ref},
+            )
+            return
+        sibling_src = sibling.get("resolved_src") or sibling.get("src")
+        if not sibling_src or not isinstance(sibling_src, str):
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.netboot.missing_sibling_src",
+                summary=f"Netboot sibling {netboot_ref!r} has no src",
+                subject_id=name,
+                details={"netboot_ref": netboot_ref},
+            )
+            return
+        try:
+            fetch_url = _resolve_withcache_url(sibling_src)
+        except ValueError as exc:
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.netboot.resolve_failed",
+                summary=f"Netboot resolve failed for {netboot_ref!r}: {exc}",
+                subject_id=name,
+                details={"netboot_ref": netboot_ref, "error": str(exc)},
+            )
+            return
+
+        target = os.path.join(self._artifacts_dir, name)
+        staging = target + ".tmp"
+        for path in (staging,):
+            with contextlib.suppress(OSError):
+                shutil.rmtree(path)
+        os.makedirs(staging, exist_ok=True)
+
+        _warmer_emit(
+            _events_log,
+            self._store,
+            kind="export.netboot.started",
+            summary=f"Fetching netboot bundle for {name} from {netboot_ref!r}",
+            subject_id=name,
+            details={"netboot_ref": netboot_ref, "fetch_url": fetch_url},
+        )
+        try:
+            # ``curl | tar -xzf -`` streams the tarball through kernel
+            # pipes without buffering the whole archive in memory.
+            # ``--strip-components=0`` because the pack script writes
+            # files at the archive root (vmlinuz + initrd + manifest,
+            # no wrapping directory).
+            curl = subprocess.Popen(
+                ["curl", "-sSL", "--fail", "--retry", "3", "--retry-delay", "1", fetch_url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert curl.stdout is not None
+            tar = subprocess.Popen(
+                ["tar", "-xzf", "-", "-C", staging],
+                stdin=curl.stdout,
+                stderr=subprocess.PIPE,
+            )
+            curl.stdout.close()
+            for proc, stage_name in ((curl, "curl"), (tar, "tar")):
+                rc = proc.wait()
+                if rc != 0:
+                    err = proc.stderr.read() if proc.stderr is not None else b""
+                    raise RuntimeError(
+                        f"{stage_name} exited {rc}: "
+                        f"{err.decode('utf-8', 'replace').strip() or '<no stderr>'}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(OSError):
+                shutil.rmtree(staging)
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.netboot.failed",
+                summary=f"Netboot fetch failed for {name}: {exc}",
+                subject_id=name,
+                details={
+                    "netboot_ref": netboot_ref,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            return
+
+        # ``manifest.json`` is the truth marker: if it's missing the
+        # bundle is malformed and we shouldn't advertise ready.
+        if not os.path.isfile(os.path.join(staging, "manifest.json")):
+            shutil.rmtree(staging)
+            _warmer_emit(
+                _events_log,
+                self._store,
+                kind="export.netboot.malformed",
+                summary=f"Netboot bundle for {name} has no manifest.json",
+                subject_id=name,
+                details={"netboot_ref": netboot_ref},
+            )
+            return
+
+        # Atomic swap: replace the old artifacts dir with staging.
+        with contextlib.suppress(OSError):
+            shutil.rmtree(target)
+        os.rename(staging, target)
+        _warmer_emit(
+            _events_log,
+            self._store,
+            kind="export.netboot.completed",
+            summary=f"Netboot bundle ready for {name}",
+            subject_id=name,
+            details={"netboot_ref": netboot_ref, "artifacts_dir": target},
+        )
 
     def _fetch_and_decompress(
         self,
@@ -1288,6 +1518,16 @@ def main() -> int:
         default=None,
         help="where decompressed .img files land (default: <data-dir>/images)",
     )
+    p.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help=(
+            "where netboot bundles (vmlinuz + initrd + manifest) land, per "
+            "export (default: <data-dir>/artifacts). Bty fetches these via "
+            "GET /artifacts/<export>/{vmlinuz,initrd} to serve the image's "
+            "own kernel in the ipxe_ramboot chain."
+        ),
+    )
     args = p.parse_args()
 
     if not args.data_dir:
@@ -1296,6 +1536,8 @@ def main() -> int:
     os.makedirs(data_dir, exist_ok=True)
     images_dir = os.path.abspath(args.images_dir or os.path.join(data_dir, "images"))
     os.makedirs(images_dir, exist_ok=True)
+    artifacts_dir = os.path.abspath(args.artifacts_dir or os.path.join(data_dir, "artifacts"))
+    os.makedirs(artifacts_dir, exist_ok=True)
 
     password = (os.environ.get("NBDMUX_ADMIN_PASSWORD") or "").strip() or None
     if password is None:
@@ -1328,7 +1570,12 @@ def main() -> int:
         store=store,
         nbdkit_bin=args.nbdkit_bin,
     )
-    warmer = Warmer(store=store, nbd=nbd, images_dir=images_dir)
+    warmer = Warmer(
+        store=store,
+        nbd=nbd,
+        images_dir=images_dir,
+        artifacts_dir=artifacts_dir,
+    )
 
     app = create_app(
         data_dir=data_dir,
@@ -1336,6 +1583,7 @@ def main() -> int:
         warmer=warmer,
         nbd=nbd,
         images_dir=images_dir,
+        artifacts_dir=artifacts_dir,
         nbd_port=args.nbd_port,
         run_lifecycle=True,
     )
@@ -1343,7 +1591,7 @@ def main() -> int:
     print(
         f"nbdmux: HTTP http://{args.bind}:{args.port}/ "
         f"NBD tcp://{args.bind}:{args.nbd_port}+/ (base port; per-export nbdkit) "
-        f"data={data_dir} images={images_dir}",
+        f"data={data_dir} images={images_dir} artifacts={artifacts_dir}",
         file=sys.stderr,
         flush=True,
     )
