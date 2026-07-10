@@ -71,6 +71,15 @@ _EXPECTED_RECORD_KEYS = {
     # Added in v0.8.1 -- the port the per-export nbdkit is listening
     # on. Null when the process isn't currently running.
     "nbd_port",
+    # Added in v0.9.0 -- the sibling catalog entry that carries the
+    # matching nosi netboot bundle (kernel + initrd + manifest). Null
+    # when the export's src catalog entry has no netboot pairing.
+    "netboot_ref",
+    # Added in v0.9.0 -- filesystem-derived boolean: True iff the
+    # Warmer's post-ready stage has extracted the netboot bundle
+    # under ``<artifacts_dir>/<name>/`` (manifest.json existence is
+    # the truth marker).
+    "netboot_ready",
 }
 
 
@@ -288,6 +297,65 @@ class DeleteExportTests(_ApiBase):
         deterministic."""
         r = self.client.delete("/exports/never-existed")
         self.assertEqual(r.status_code, 404)
+
+    def test_delete_cleans_up_artifacts_dir(self) -> None:
+        """Extracted netboot bundles must be dropped in lockstep with
+        the export they belong to -- a re-warmed export must not
+        inherit stale kernel/initrd files from a previous run."""
+        path = self._write_file("demo.img")
+        self.client.post("/exports", json={"name": "demo", "file": path})
+        artifacts_root = os.path.join(self._tmpdir, "artifacts", "demo")
+        os.makedirs(artifacts_root, exist_ok=True)
+        for filename in ("vmlinuz", "initrd", "manifest.json"):
+            with open(os.path.join(artifacts_root, filename), "wb") as f:
+                f.write(b"x")
+        self.assertTrue(os.path.exists(artifacts_root))
+        r = self.client.delete("/exports/demo")
+        self.assertEqual(r.status_code, 204)
+        self.assertFalse(os.path.exists(artifacts_root))
+
+
+class ArtifactRouteTests(_ApiBase):
+    """The ``GET /artifacts/{name}/{vmlinuz,initrd,manifest.json}``
+    routes serve bytes out of ``<artifacts_dir>/<name>/``. Bty's
+    ipxe_ramboot chain uses them directly, so their status codes +
+    content-types are wire contract."""
+
+    def _seed_artifacts(self, name: str, files: dict[str, bytes]) -> None:
+        target = os.path.join(self._tmpdir, "artifacts", name)
+        os.makedirs(target, exist_ok=True)
+        for filename, content in files.items():
+            with open(os.path.join(target, filename), "wb") as f:
+                f.write(content)
+
+    def test_artifact_vmlinuz_served_when_present(self) -> None:
+        self._seed_artifacts("demo", {"vmlinuz": b"kernel-bytes"})
+        r = self.client.get("/artifacts/demo/vmlinuz")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"kernel-bytes")
+        self.assertEqual(r.headers["content-type"], "application/octet-stream")
+
+    def test_artifact_missing_returns_404(self) -> None:
+        r = self.client.get("/artifacts/demo/vmlinuz")
+        self.assertEqual(r.status_code, 404)
+
+    def test_artifact_invalid_export_name_returns_404(self) -> None:
+        """The export-name validator refuses ``../`` etc.; the artifact
+        route MUST refuse the same so path-traversal probes are 404,
+        not 200 leaking bytes outside the artifacts dir."""
+        r = self.client.get("/artifacts/..%2fetc%2fpasswd/vmlinuz")
+        self.assertEqual(r.status_code, 404)
+
+    def test_netboot_ready_flip_when_manifest_lands(self) -> None:
+        """GET /exports advertises ``netboot_ready`` as True iff the
+        manifest.json exists under ``<artifacts_dir>/<name>/``."""
+        path = self._write_file("demo.img")
+        self.client.post("/exports", json={"name": "demo", "file": path})
+        before = self.client.get("/exports").json()[0]
+        self.assertFalse(before["netboot_ready"])
+        self._seed_artifacts("demo", {"manifest.json": b'{"framework":"initramfs-tools"}'})
+        after = self.client.get("/exports").json()[0]
+        self.assertTrue(after["netboot_ready"])
 
 
 class AuthOffOpenModeTests(_ApiBase):

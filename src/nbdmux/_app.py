@@ -129,6 +129,7 @@ def create_app(
     warmer: Any | None = None,
     nbd: Any | None = None,
     images_dir: str | os.PathLike[str] | None = None,
+    artifacts_dir: str | os.PathLike[str] | None = None,
     nbd_port: int = 10809,
     run_lifecycle: bool = False,
 ) -> FastAPI:
@@ -172,7 +173,8 @@ def create_app(
             print(
                 f"nbdmux: NBD tcp://:{_app.state.nbd_port}/ "
                 f"data={_app.state.data_dir} "
-                f"images={_app.state.images_dir}",
+                f"images={_app.state.images_dir} "
+                f"artifacts={_app.state.artifacts_dir}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -221,9 +223,13 @@ def create_app(
     app.state.images_dir = (
         str(images_dir) if images_dir is not None else str(Path(data_dir_str) / "images")
     )
+    app.state.artifacts_dir = (
+        str(artifacts_dir) if artifacts_dir is not None else str(Path(data_dir_str) / "artifacts")
+    )
     app.state.data_dir = data_dir_str
     app.state.nbd_port = nbd_port
     Path(app.state.images_dir).mkdir(parents=True, exist_ok=True)
+    Path(app.state.artifacts_dir).mkdir(parents=True, exist_ok=True)
     # Ensure the settings table exists so the Settings render + save
     # handlers don't crash on a fresh state.db. Store owns the exports
     # table; settings sits alongside it in the same DB.

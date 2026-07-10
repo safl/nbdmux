@@ -561,7 +561,12 @@ class TestWarmerProcess(unittest.TestCase):
         os.makedirs(self.images_dir, exist_ok=True)
         self.store = server.Store(self.tmpdir)
         self.nbd = _FakeNbdServer()
-        self.warmer = server.Warmer(store=self.store, nbd=self.nbd, images_dir=self.images_dir)
+        self.warmer = server.Warmer(
+            store=self.store,
+            nbd=self.nbd,
+            images_dir=self.images_dir,
+            artifacts_dir=self.images_dir,
+        )
         self._saved = os.environ.get("NBDMUX_WITHCACHE_URL")
         # Point the warmer at the local origin; the ``/b/<b64>``
         # rewriting sits above the transport and the local origin
@@ -761,7 +766,9 @@ class TestWarmerEnqueueDedup(unittest.TestCase):
         self.store = server.Store(self.tmpdir)
         self.nbd = _FakeNbdServer()
         # Do NOT call .start(); we only exercise .enqueue().
-        self.warmer = server.Warmer(store=self.store, nbd=self.nbd, images_dir=self.tmpdir)
+        self.warmer = server.Warmer(
+            store=self.store, nbd=self.nbd, images_dir=self.tmpdir, artifacts_dir=self.tmpdir
+        )
 
     def test_dedup_across_multiple_calls(self):
         self.warmer.enqueue("x")
@@ -805,7 +812,12 @@ class TestWarmerCorruptPayload(unittest.TestCase):
         os.makedirs(self.images_dir)
         self.store = server.Store(self.tmpdir)
         self.nbd = _FakeNbdServer()
-        self.warmer = server.Warmer(store=self.store, nbd=self.nbd, images_dir=self.images_dir)
+        self.warmer = server.Warmer(
+            store=self.store,
+            nbd=self.nbd,
+            images_dir=self.images_dir,
+            artifacts_dir=self.images_dir,
+        )
         self._saved = os.environ.get("NBDMUX_WITHCACHE_URL")
         os.environ["NBDMUX_WITHCACHE_URL"] = f"http://127.0.0.1:{self.origin.server_address[1]}"
 
