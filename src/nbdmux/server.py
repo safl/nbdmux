@@ -1167,6 +1167,42 @@ class Warmer:
         return final_size
 
 
+WARMABLE_FORMATS: frozenset[str] = frozenset(
+    {
+        # Raw / uncompressed. Empty / None normalises here too because
+        # ``_detect_format`` falls back to ``""`` for URLs whose suffix
+        # doesn't identify a compression.
+        "img",
+        "",
+        # gzip family.
+        "img.gz",
+        "gz",
+        ".gz",
+        # zstd family.
+        "img.zst",
+        "zst",
+        ".zst",
+        # xz family.
+        "img.xz",
+        "xz",
+        ".xz",
+    }
+)
+
+
+def is_warmable_format(format_hint: str | None) -> bool:
+    """Return True iff the Warmer knows how to fetch + decompress a
+    catalog entry advertising this format string.
+
+    Used by the picker in :mod:`nbdmux._app` to hide catalog entries
+    the Warmer would reject at enqueue time (e.g. the ``tar.gz``
+    netboot bundle entries nosi's ``gen_catalog.py`` emits alongside
+    each disk image -- those are consumed by the Warmer indirectly
+    via the sibling disk-image export's ``netboot_ref`` fetch stage,
+    never as standalone NBD-servable exports)."""
+    return (format_hint or "") in WARMABLE_FORMATS
+
+
 def _decompressor_cmd(format_hint: str) -> list[str]:
     """Map a format hint to a stdin-to-stdout decompressor command.
 

@@ -76,10 +76,22 @@ def _fetch_withcache_catalog(
         return [], f"catalog at {endpoint} returned a non-list ``entries`` field"
     # Since withcache v0.11.0, ``GET /catalog`` returns ONLY
     # downloaded entries -- staged entries stay invisible until
-    # their bytes land. So every entry we see here is by
-    # definition exportable; no picker-side filter needed. Just
-    # sanity-check the row shape.
-    return [e for e in entries if isinstance(e, dict) and isinstance(e.get("src"), str)], None
+    # their bytes land. Since nosi PR-3 the catalog also lists
+    # ``tar.gz`` netboot-bundle entries paired with each disk
+    # image; the Warmer can't warm those directly (it only knows
+    # gz/zst/xz decompressors) and pushes them through implicitly
+    # at the disk-image export's ``netboot_ref`` stage. Filter to
+    # warmable formats here so the picker never offers an operator
+    # an export shape that would fail at enqueue time.
+    from .server import is_warmable_format
+
+    return [
+        e
+        for e in entries
+        if isinstance(e, dict)
+        and isinstance(e.get("src"), str)
+        and is_warmable_format(e.get("format"))
+    ], None
 
 
 def _build_jinja(templates_dir: Path) -> Environment:
