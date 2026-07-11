@@ -44,6 +44,7 @@ from .server import (
     _lookup_withcache_entry_for_src,
     _valid_export_name,
 )
+from .server import is_warmable_format as _is_warmable_format
 
 
 class _StoreProto:
@@ -295,6 +296,22 @@ def register_api_routes(
                 ),
             )
         format_hint = _detect_format(src_url, format_override)
+        # Reject at the API boundary if the resolved format is not
+        # one the Warmer can process. Guards against catalog-entry
+        # types that flow through withcache but aren't NBD-warmable
+        # (e.g. nosi's ``tar.gz`` netboot-bundle entries, which
+        # nbdmux consumes indirectly via the disk-image export's
+        # ``netboot_ref`` fetch stage). The picker in _app.py
+        # already filters those out; this is a defensive check for
+        # direct API callers.
+        if not _is_warmable_format(format_hint):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"format {format_hint!r} is not supported by the Warmer; "
+                    "nbdmux only accepts raw (img) or gzip/zstd/xz disk images"
+                ),
+            )
         # Capture netboot_ref onto the row at register time so the
         # Warmer's post-ready stage does not need to re-hit withcache
         # (and so a later ``GET /exports`` advertises the pairing even
