@@ -162,6 +162,20 @@ class GetExportByNameTests(_ApiBase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["name"], "demo")
 
+    def test_get_export_agrees_with_get_exports_on_every_key(self) -> None:
+        """The single-row shape must carry the same fields as the
+        list shape -- specifically ``netboot_ready``, which is
+        enriched from the artifacts dir in the list handler and used
+        to be missing on the single-row path. A downstream comparing
+        the two would see ``None vs False`` on a fresh export."""
+        path = self._write_file("dummy.img")
+        self.client.post("/exports", json={"name": "demo", "file": path})
+        listed = next(r for r in self.client.get("/exports").json() if r["name"] == "demo")
+        single = self.client.get("/export/demo").json()
+        self.assertEqual(set(single.keys()), set(listed.keys()))
+        for key in listed:
+            self.assertEqual(single[key], listed[key], f"disagreement on {key!r}")
+
 
 class PostExportPrewarmedShapeTests(_ApiBase):
     """``{name, file, readonly?}`` -> status='ready'. Pre-warmed

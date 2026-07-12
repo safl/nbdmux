@@ -216,11 +216,16 @@ def register_api_routes(
     @app.get("/export/{name}", response_model=None)
     def get_export(name: str, request: Request) -> dict[str, Any]:
         """Return a single export record, or 404 when the name is
-        unknown. No bty caller uses it today; kept for the client
-        library + operator curl surface."""
+        unknown. Enriches with ``netboot_ready`` the same way
+        ``GET /exports`` does so the single-row shape agrees with
+        the list shape; a downstream comparison that reads either
+        endpoint sees identical fields."""
         record = _get_store(request.app).get_export(name)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no export named {name!r}")
+        artifacts_dir = _get_artifacts_dir(request.app)
+        manifest_path = os.path.join(artifacts_dir, record.get("name", ""), "manifest.json")
+        record["netboot_ready"] = os.path.isfile(manifest_path)
         return record
 
     # ---------- POST /exports (auth-gated) --------------------------------
